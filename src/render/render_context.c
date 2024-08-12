@@ -360,11 +360,18 @@ static void addVert(float x, float y, float z, float sclz, struct vertbuf* buf) 
   memcpy(buf->vert2, buf->vert3, 3*sizeof(float));
   buf->vert3[0] = x;
   buf->vert3[1] = y;
-  buf->vert3[2] = z*sclz;
-  buf->nvert++;
+  if (z != mjMAXVAL) {
+    buf->vert3[2] = z*sclz;
+    buf->nvert++;
+  } else {
+    buf->vert3[2] = mjMAXVAL;
+    buf->nvert++;
+    return;
+  }
 
   // triangle ready
-  if (buf->nvert >= 3) {
+  if (buf->nvert >= 3 && buf->vert1[2] != mjMAXVAL &&
+      buf->vert2[2] != mjMAXVAL && buf->vert3[2] != mjMAXVAL) {
     // compensate for alternating orientation
     if (buf->nvert%2) {
       mjr_makeNormal(normal, buf->vert1, buf->vert2, buf->vert3);
@@ -442,34 +449,42 @@ void mjr_uploadHField(const mjModel* m, const mjrContext* con, int hfieldid) {
   glBegin(GL_QUADS);
   for (int r=0; r < nr-1; r++) {
     // left
-    glNormal3f(-1, 0, 0);
-    glVertex3f(-sz[0], sz[1]*((r+1)/height-1.0f), -sz[3]);
-    glVertex3f(-sz[0], sz[1]*((r+0)/height-1.0f), -sz[3]);
-    glVertex3f(-sz[0], sz[1]*((r+0)/height-1.0f), data[(r+0)*nc]*sz[2]);
-    glVertex3f(-sz[0], sz[1]*((r+1)/height-1.0f), data[(r+1)*nc]*sz[2]);
+    if (data[(r+0)*nc] != mjMAXVAL && data[(r+1)*nc] != mjMAXVAL) {
+      glNormal3f(-1, 0, 0);
+      glVertex3f(-sz[0], sz[1]*((r+1)/height-1.0f), -sz[3]);
+      glVertex3f(-sz[0], sz[1]*((r+0)/height-1.0f), -sz[3]);
+      glVertex3f(-sz[0], sz[1]*((r+0)/height-1.0f), data[(r+0)*nc]*sz[2]);
+      glVertex3f(-sz[0], sz[1]*((r+1)/height-1.0f), data[(r+1)*nc]*sz[2]);
+    }
 
     // right
-    glNormal3f(+1, 0, 0);
-    glVertex3f(+sz[0], sz[1]*((r+0)/height-1.0f), -sz[3]);
-    glVertex3f(+sz[0], sz[1]*((r+1)/height-1.0f), -sz[3]);
-    glVertex3f(+sz[0], sz[1]*((r+1)/height-1.0f), data[(r+1)*nc + nc-1]*sz[2]);
-    glVertex3f(+sz[0], sz[1]*((r+0)/height-1.0f), data[(r+0)*nc + nc-1]*sz[2]);
+    if (data[(r+1)*nc + nc-1] != mjMAXVAL && data[(r+0)*nc + nc-1] != mjMAXVAL) {
+      glNormal3f(+1, 0, 0);
+      glVertex3f(+sz[0], sz[1]*((r+0)/height-1.0f), -sz[3]);
+      glVertex3f(+sz[0], sz[1]*((r+1)/height-1.0f), -sz[3]);
+      glVertex3f(+sz[0], sz[1]*((r+1)/height-1.0f), data[(r+1)*nc + nc-1]*sz[2]);
+      glVertex3f(+sz[0], sz[1]*((r+0)/height-1.0f), data[(r+0)*nc + nc-1]*sz[2]);
+    }
   }
 
   for (int c=0; c < nc-1; c++) {
     // front
-    glNormal3f(0, -1, 0);
-    glVertex3f(sz[0]*((c+0)/width-1.0f), -sz[1], -sz[3]);
-    glVertex3f(sz[0]*((c+1)/width-1.0f), -sz[1], -sz[3]);
-    glVertex3f(sz[0]*((c+1)/width-1.0f), -sz[1], data[c+1]*sz[2]);
-    glVertex3f(sz[0]*((c+0)/width-1.0f), -sz[1], data[c]*sz[2]);
+    if (data[c+1] != mjMAXVAL && data[c] != mjMAXVAL) {
+      glNormal3f(0, -1, 0);
+      glVertex3f(sz[0]*((c+0)/width-1.0f), -sz[1], -sz[3]);
+      glVertex3f(sz[0]*((c+1)/width-1.0f), -sz[1], -sz[3]);
+      glVertex3f(sz[0]*((c+1)/width-1.0f), -sz[1], data[c+1]*sz[2]);
+      glVertex3f(sz[0]*((c+0)/width-1.0f), -sz[1], data[c]*sz[2]);
+    }
 
     // back
-    glNormal3f(0, +1, 0);
-    glVertex3f(sz[0]*((c+1)/width-1.0f), +sz[1], -sz[3]);
-    glVertex3f(sz[0]*((c+0)/width-1.0f), +sz[1], -sz[3]);
-    glVertex3f(sz[0]*((c+0)/width-1.0f), +sz[1], data[(nr-1)*nc + c]*sz[2]);
-    glVertex3f(sz[0]*((c+1)/width-1.0f), +sz[1], data[(nr-1)*nc + c+1]*sz[2]);
+    if (data[(nr-1)*nc + c] != mjMAXVAL && data[(nr-1)*nc + c+1] != mjMAXVAL) {
+      glNormal3f(0, +1, 0);
+      glVertex3f(sz[0]*((c+1)/width-1.0f), +sz[1], -sz[3]);
+      glVertex3f(sz[0]*((c+0)/width-1.0f), +sz[1], -sz[3]);
+      glVertex3f(sz[0]*((c+0)/width-1.0f), +sz[1], data[(nr-1)*nc + c]*sz[2]);
+      glVertex3f(sz[0]*((c+1)/width-1.0f), +sz[1], data[(nr-1)*nc + c+1]*sz[2]);
+    }
   }
 
   // recompute for bottom drawing: different number of grid points
