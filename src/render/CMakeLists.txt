@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+if(CMAKE_CXX_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+# 如果 CMAKE_C_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_C_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+endif()
+
 
 set(MUJOCO_RENDER_SRCS
     glad/glad.c

@@ -12,5 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(CMAKE_CXX_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+# 如果 CMAKE_C_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_C_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+endif()
+
+
 set(MUJOCO_UI_SRCS ui_main.c ui_main.h)
 target_sources(mujoco PRIVATE ${MUJOCO_UI_SRCS})

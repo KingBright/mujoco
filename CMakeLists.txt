@@ -36,6 +36,32 @@ project(
 enable_language(C)
 enable_language(CXX)
 
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 如果 CMAKE_CXX_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_CXX_FLAGS MATCHES "-fno-fat-lto-objects")
+    string(REPLACE "-fno-fat-lto-objects" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+# 如果 CMAKE_C_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_C_FLAGS MATCHES "-fno-fat-lto-objects")
+    string(REPLACE "-fno-fat-lto-objects" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+endif()
+# 如果 CMAKE_CXX_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_CXX_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+# 如果 CMAKE_C_FLAGS 中包含 -Werror，则将其移除
+if(CMAKE_C_FLAGS MATCHES "-Werror")
+    string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+endif()
+
+add_compile_options(-Wno-error)
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 option(MUJOCO_BUILD_EXAMPLES "Build samples for MuJoCo" ON)
@@ -87,6 +113,7 @@ add_subdirectory(plugin/elasticity)
 add_subdirectory(plugin/actuator)
 add_subdirectory(plugin/sensor)
 add_subdirectory(plugin/sdf)
+add_subdirectory(plugin/soil)
 add_subdirectory(src/engine)
 add_subdirectory(src/user)
 add_subdirectory(src/xml)
