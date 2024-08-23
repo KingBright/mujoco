@@ -3647,7 +3647,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
     for (int i = 0; i < nplugin; ++i) {
       const mjpPlugin* plugin = mjp_getPluginAtSlot(m->plugin[i]);
       if (!plugin->nstate) {
-        mju_error("`nstate` is null for plugin at slot %d", m->plugin[i]);
+        mju_error("`nstate` is null for plugin %s ", plugin->name);
       }
       int nstate = plugin->nstate(m, i);
       m->plugin_stateadr[i] = stateadr;
@@ -3656,7 +3656,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
       if (plugin->capabilityflags & mjPLUGIN_SENSOR) {
         for (int sensor_id : plugin_to_sensors[i]) {
           if (!plugin->nsensordata) {
-            mju_error("`nsensordata` is null for plugin at slot %d", m->plugin[i]);
+            mju_error("`nsensordata` is null for plugin %s", plugin->name);
           }
           int nsensordata = plugin->nsensordata(m, i, sensor_id);
           sensors_[sensor_id]->dim = nsensordata;

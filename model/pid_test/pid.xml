@@ -1,0 +1,24 @@
+<mujoco>
+  <extension>
+    <plugin plugin="mujoco.pid">
+      <instance name="pid">
+        <config key="kp" value="40.0"/>
+        <config key="ki" value="40"/>
+        <config key="kd" value="4"/>
+        <config key="slewmax" value="3" />
+        <config key="imax" value="1"/>
+      </instance>
+    </plugin>
+  </extension>
+
+  <worldbody>
+    <body>
+      <joint name="j" type="slide" axis="0 0 1" />
+      <geom size="0.01" mass="1"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <plugin joint="j" plugin="mujoco.pid" instance="pid" actdim="2"/>
+  </actuator>
+</mujoco>

@@ -248,6 +248,11 @@ void Soil::Compute(const mjModel* m, mjData* d, int instance) {
                 }
             }
         }
+
+        // TODO 缺少context，暂时无法在这里更新
+        // mjr_uploadHField(m, con, terrain_id);
+        // mjr_uploadHField(m, con, bucket_soil_1_id);
+        // mjr_uploadHField(m, con, bucket_soil_2_id);
     }
 }
 

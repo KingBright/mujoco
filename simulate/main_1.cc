@@ -387,23 +387,6 @@ void PhysicsLoop(mj::Simulate& sim) {
           const auto elapsedCPU = startCPU - syncCPU;
           double elapsedSim = d->time - syncSim;
 
-          // inject noise
-          if (sim.ctrl_noise_std) {
-            // convert rate and scale to discrete time (Ornstein–Uhlenbeck)
-            mjtNum rate = mju_exp(
-              -m->opt.timestep / mju_max(sim.ctrl_noise_rate, mjMINVAL));
-            mjtNum scale = sim.ctrl_noise_std * mju_sqrt(1-rate*rate);
-
-            for (int i = 0; i < m->nu; i++) {
-              // update noise
-              ctrlnoise[i] = (
-                rate * ctrlnoise[i] + scale * mju_standardNormal(nullptr));
-
-              // apply noise
-              d->ctrl[i] = ctrlnoise[i];
-            }
-          }
-
           // requested slow-down factor
           double slowdown = 100 / sim.percentRealTime[sim.real_time_index];
 
