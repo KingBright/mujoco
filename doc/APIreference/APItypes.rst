@@ -346,6 +346,16 @@ These are the possible sensor data types, used in ``mjData.sensor_datatype``.
 .. mujoco-include:: mjtDataType
 
 
+.. _mjtSameFrame:
+
+mjtSameFrame
+~~~~~~~~~~~~
+
+Types of frame alignment of elements with their parent bodies. Used as shortcuts during :ref:`mj_kinematics` in the
+last argument to :ref:`mj_local2global`.
+
+.. mujoco-include:: mjtSameFrame
+
 
 .. _tyDataEnums:
 
@@ -647,6 +657,15 @@ mjtLimited
 Type of limit specification.
 
 .. mujoco-include:: mjtLimited
+
+.. _mjtAlignFree:
+
+mjtAlignFree
+~~~~~~~~~~~~
+
+Whether to align free joints with the inertial frame.
+
+.. mujoco-include:: mjtAlignFree
 
 .. _mjtInertiaFromGeom:
 
@@ -1393,6 +1412,8 @@ Alternative orientation specifiers.
 
 .. _ArrayHandles:
 
+.. _mjByteVec:
+
 .. _mjString:
 
 .. _mjStringVec:
@@ -1424,6 +1445,7 @@ C handles for C++ strings and vector types. When using from C, use the provided 
      using mjFloatVec    = std::vector<float>;
      using mjFloatVecVec = std::vector<std::vector<float>>;
      using mjDoubleVec   = std::vector<double>;
+     using mjByteVec     = std::vector<std::byte>;
    #else
      // C: opaque types
      typedef void mjString;
@@ -1433,6 +1455,7 @@ C handles for C++ strings and vector types. When using from C, use the provided 
      typedef void mjFloatVec;
      typedef void mjFloatVecVec;
      typedef void mjDoubleVec;
+     typedef void mjByteVec;
    #endif
 
 

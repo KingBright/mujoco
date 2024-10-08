@@ -22,6 +22,7 @@
 
 // this is a C-API
 #ifdef __cplusplus
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,7 @@ extern "C" {
   using mjFloatVec    = std::vector<float>;
   using mjFloatVecVec = std::vector<std::vector<float>>;
   using mjDoubleVec   = std::vector<double>;
+  using mjByteVec     = std::vector<std::byte>;
 #else
   // C: opaque types
   typedef void mjString;
@@ -48,6 +50,7 @@ extern "C" {
   typedef void mjFloatVec;
   typedef void mjFloatVecVec;
   typedef void mjDoubleVec;
+  typedef void mjByteVec;
 #endif
 
 
@@ -80,6 +83,12 @@ typedef enum mjtLimited_ {         // type of limit specification
   mjLIMITED_TRUE,                  // limited
   mjLIMITED_AUTO,                  // limited inferred from presence of range
 } mjtLimited;
+
+typedef enum mjtAlignFree_ {       // whether to align free joints with the inertial frame
+  mjALIGNFREE_FALSE = 0,           // don't align
+  mjALIGNFREE_TRUE,                // align
+  mjALIGNFREE_AUTO,                // respect the global compiler flag
+} mjtAlignFree;
 
 
 typedef enum mjtInertiaFromGeom_ { // whether to infer body inertias from child geoms
@@ -128,6 +137,7 @@ typedef struct mjSpec_ {           // model specification
   int inertiafromgeom;             // use geom inertias (mjtInertiaFromGeom)
   int inertiagrouprange[2];        // range of geom groups used to compute inertia
   mjtByte exactmeshinertia;        // if false, use old formula
+  int alignfree;                   // align free joints with inertial frame
   mjLROpt LRopt;                   // options for lengthrange computation
 
   // engine data
@@ -171,10 +181,9 @@ typedef struct mjsOrientation_ {   // alternative orientation specifiers
 
 
 typedef struct mjsPlugin_ {        // plugin specification
-  mjsElement* instance;            // element type
-  mjString* name;                  // name
-  mjString* instance_name;         // instance name
-  int plugin_slot;                 // global registered slot number of the plugin
+  mjsElement* element;             // element type
+  mjString* name;                  // instance name
+  mjString* plugin_name;           // plugin name
   mjtByte active;                  // is the plugin active
   mjString* info;                  // message appended to compiler errors
 } mjsPlugin;
@@ -228,6 +237,7 @@ typedef struct mjsJoint_ {         // joint specification
   double pos[3];                   // anchor position
   double axis[3];                  // joint axis
   double ref;                      // value at reference configuration: qpos0
+  int align;                       // align free joint with body com (mjtAlignFree)
 
   // stiffness
   double stiffness;                // stiffness coefficient
@@ -413,6 +423,10 @@ typedef struct mjsFlex_ {          // flex specification
   double edgedamping;              // edge damping
   float rgba[4];                   // rgba when material is omitted
   mjString* material;              // name of material used for rendering
+  double young;                    // Young's modulus
+  double poisson;                  // Poisson's ratio
+  double damping;                  // Rayleigh's damping
+  double thickness;                // thickness (2D only)
 
   // mesh properties
   mjStringVec* vertbody;           // vertex body names
@@ -511,6 +525,9 @@ typedef struct mjsTexture_ {       // texture specification
   // method 3: separate files
   mjStringVec* cubefiles;          // different file for each side of the cube
 
+  // method 4: from buffer read by user
+  mjByteVec* data;                  // texture data
+
   // flip options
   mjtByte hflip;                   // horizontal flip
   mjtByte vflip;                   // vertical flip
@@ -572,6 +589,7 @@ typedef struct mjsEquality_ {      // equality specification
   mjtByte active;                  // is equality initially active
   mjString* name1;                 // name of object 1
   mjString* name2;                 // name of object 2
+  mjtObj objtype;                  // type of both objects
   mjtNum solref[mjNREF];           // solver reference
   mjtNum solimp[mjNIMP];           // solver impedance
   mjString* info;                  // message appended to errors

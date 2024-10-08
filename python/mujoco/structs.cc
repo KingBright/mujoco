@@ -87,21 +87,6 @@ inline std::size_t NConMax(const mjData* d) {
   return d->narena / sizeof(mjContact);
 }
 
-// strip path prefix from filename and make lowercase
-std::string StripPath(const char* name) {
-  std::string filename(name);
-  size_t start = filename.find_last_of("/\\");
-
-  // get name without path
-  if (start != std::string::npos) {
-    filename = filename.substr(start + 1, filename.size() - start - 1);
-  }
-
-  // make lowercase
-  std::transform(filename.begin(), filename.end(), filename.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return filename;
-}
 }  // namespace
 
 // ==================== MJOPTION ===============================================
@@ -318,16 +303,6 @@ MjModelWrapper::~MjWrapper() {
   }
 }
 
-namespace {
-struct VfsAsset {
-  VfsAsset(const char* name, const void* content, std::size_t content_size)
-      : name(name), content(content), content_size(content_size) {}
-  const char* name;
-  const void* content;
-  std::size_t content_size;
-};
-}
-
 // Helper function for both LoadXMLFile and LoadBinaryFile.
 // Creates a temporary MJB from the assets dictionary if one is supplied.
 template <typename LoadFunc>
@@ -345,7 +320,13 @@ static raw::MjModel* LoadModelFileImpl(
       const int vfs_error = InterceptMjErrors(mj_addBufferVFS)(
           vfs_ptr, buffer_name.c_str(), asset.content, asset.content_size);
       if (vfs_error) {
-        throw py::value_error("assets dict is too big");
+        mj_deleteVFS(vfs_ptr);
+        if (vfs_error == 2) {
+          throw py::value_error("Repeated file name in assets dict: " +
+                                buffer_name);
+        } else {
+          throw py::value_error("Asset failed to load: " + buffer_name);
+        }
       }
     }
   }
@@ -357,22 +338,6 @@ static raw::MjModel* LoadModelFileImpl(
     model = nullptr;
   }
   return model;
-}
-
-// Converts a dict with py::bytes value to a vector of standard C++ types.
-// This allows us to release the GIL early. Note that the vector consists only
-// of pointers to existing data so no substantial data copies are being made.
-static std::vector<VfsAsset>
-ConvertAssetsDict(
-    const std::optional<std::unordered_map<std::string, py::bytes>>& assets) {
-  std::vector<VfsAsset> out;
-  if (assets.has_value()) {
-    for (const auto& [name, content] : *assets) {
-      out.emplace_back(name.c_str(), PYBIND11_BYTES_AS_STRING(content.ptr()),
-                       py::len(content));
-    }
-  }
-  return out;
 }
 
 MjModelWrapper MjModelWrapper::LoadXMLFile(
@@ -456,7 +421,9 @@ py::tuple RecompileSpec(raw::MjSpec* spec, const MjModelWrapper& old_m,
   raw::MjModel* m = static_cast<raw::MjModel*>(mju_malloc(sizeof(mjModel)));
   m->buffer = nullptr;
   raw::MjData* d = mj_copyData(nullptr, old_m.get(), old_d.get());
-  mj_recompile(spec, nullptr, m, d);
+  if (mj_recompile(spec, nullptr, m, d)) {
+    throw py::value_error(mjs_getError(spec));
+  }
 
   py::object m_pyobj = py::cast((MjModelWrapper(m)));
   py::object d_pyobj =

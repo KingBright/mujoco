@@ -20,6 +20,7 @@
 #include <mujoco/mjdata.h>
 #include <mujoco/mjmacro.h>
 #include <mujoco/mjmodel.h>
+#include <mujoco/mjsan.h>  // IWYU pragma: keep
 #include <mujoco/mjvisualize.h>
 #include "engine/engine_array_safety.h"
 #include "engine/engine_io.h"
@@ -94,6 +95,20 @@ static void islandColor(float rgba[4], int islanddofadr) {
   rgba[1] = 0.1f + 0.8f*mju_Halton(islanddofadr + 1, 3);
   rgba[2] = 0.1f + 0.8f*mju_Halton(islanddofadr + 1, 5);
   rgba[3] = 1;
+}
+
+// make a triangle in thisgeom at coordinates v0, v1, v2 with a given color
+static void makeTriangle(mjvGeom* thisgeom, const mjtNum v0[3], const mjtNum v1[3],
+                         const mjtNum v2[3], const float rgba[4]) {
+  mjtNum e1[3] =  {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+  mjtNum e2[3] =  {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+  mjtNum normal[3];
+  mju_cross(normal, e1, e2);
+  mjtNum lengths[3] = {mju_normalize3(e1), mju_normalize3(e2), mju_normalize3(normal)};
+  mjtNum xmat[9] = {e1[0], e2[0], normal[0],
+                    e1[1], e2[1], normal[1],
+                    e1[2], e2[2], normal[2]};
+  mjv_initGeom(thisgeom, mjGEOM_TRIANGLE, lengths, v0, xmat, rgba);
 }
 
 // add contact-related geoms in mjvObject
@@ -515,7 +530,6 @@ void mjv_addGeoms(const mjModel* m, mjData* d, const mjvOption* vopt,
                   const mjvPerturb* pert, int catmask, mjvScene* scn) {
   int objtype, category;
   mjtNum sz[3], mat[9], selpos[3];
-  mjtNum catenary[3*mjNCATENARY];
   mjtNum *cur, *nxt, *xfrc;
   mjtNum vec[3], end[3], axis[3], rod, len, det, tmp[9], quat[4];
   mjtByte broken;
@@ -1553,20 +1567,10 @@ void mjv_addGeoms(const mjModel* m, mjData* d, const mjvOption* vopt,
         // triangulation and wireframe of the frustum
         for (int e=0; e < 4; e++) {
           START
-          mju_sub3(x, vfar[e], vnear[e]);
-          mju_sub3(y, vnear[(e+1)%4], vnear[e]);
-          mju_cross(z, x, y);
-          mjtNum tri1[3] = {mju_normalize3(x), mju_normalize3(y), mju_normalize3(z)};
-          mjtNum xmat1[9] = {x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]};
-          mjv_initGeom(thisgeom, mjGEOM_TRIANGLE, tri1, vnear[e], xmat1, rgba);
+          makeTriangle(thisgeom, vnear[e], vfar[e], vnear[(e+1)%4], rgba);
           FINISH
           START
-          mju_sub3(y, vnear[(e+1)%4], vfar[e]);
-          mju_sub3(x, vfar[(e+1)%4], vfar[e]);
-          mju_cross(z, x, y);
-          mjtNum tri2[3] = {mju_normalize3(x), mju_normalize3(y), mju_normalize3(z)};
-          mjtNum xmat2[9] = {x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]};
-          mjv_initGeom(thisgeom, mjGEOM_TRIANGLE, tri2, vfar[e], xmat2, rgba);
+          makeTriangle(thisgeom, vfar[e], vfar[(e+1)%4], vnear[(e+1)%4], rgba);
           FINISH
           START
           mjv_connector(thisgeom, mjGEOM_LINE, 3, vnear[e], vnear[(e+1)%4]);
@@ -1812,8 +1816,15 @@ void mjv_addGeoms(const mjModel* m, mjData* d, const mjvOption* vopt,
             length = m->tendon_lengthspring[2*i+1];
           }
 
+          // get number of points along catenary path
+          int ncatenary = m->vis.quality.numslices + 1;
+
+          // allocate catenary
+          mj_markStack(d);
+          mjtNum* catenary = mj_stackAllocNum(d, 3*ncatenary);
+
           // points along catenary path
-          int npoints = mjv_catenary(x0, x1, m->opt.gravity, length, catenary);
+          int npoints = mjv_catenary(x0, x1, m->opt.gravity, length, catenary, ncatenary);
 
           // draw npoints-1 segments
           for (int j=0; j < npoints-1; j++) {
@@ -1834,6 +1845,7 @@ void mjv_addGeoms(const mjModel* m, mjData* d, const mjvOption* vopt,
 
             FINISH
           }
+          mj_freeStack(d);
         }
       }
     }
@@ -2017,26 +2029,38 @@ void mjv_addGeoms(const mjModel* m, mjData* d, const mjvOption* vopt,
   if (vopt->flags[mjVIS_CONSTRAINT] && (category & catmask) && m->neq) {
     // connect or weld
     for (int i=0; i < m->neq; i++) {
-      if (d->eq_active[i] && (m->eq_type[i] == mjEQ_CONNECT || m->eq_type[i] == mjEQ_WELD)) {
+      int is_weld = m->eq_type[i] == mjEQ_WELD;
+      int is_connect = m->eq_type[i] == mjEQ_CONNECT;
+      if (d->eq_active[i] && (is_connect || is_weld)) {
         // compute endpoints in global coordinates
+        mjtNum *xmat_j, *xmat_k;
         int j = m->eq_obj1id[i], k = m->eq_obj2id[i];
-        mju_mulMatVec3(vec, d->xmat+9*j, m->eq_data+mjNEQDATA*i+3*(m->eq_type[i] == mjEQ_WELD));
-        mju_addTo3(vec, d->xpos+3*j);
-        mju_mulMatVec3(end, d->xmat+9*k, m->eq_data+mjNEQDATA*i+3*(m->eq_type[i] == mjEQ_CONNECT));
-        mju_addTo3(end, d->xpos+3*k);
+        if (m->eq_objtype[i] == mjOBJ_SITE) {
+          mju_copy3(vec, d->site_xpos+3*j);
+          mju_copy3(end, d->site_xpos+3*k);
+          xmat_j = d->site_xmat+9*j;
+          xmat_k = d->site_xmat+9*k;
+        } else {
+          mju_mulMatVec3(vec, d->xmat+9*j, m->eq_data+mjNEQDATA*i+3*is_weld);
+          mju_addTo3(vec, d->xpos+3*j);
+          mju_mulMatVec3(end, d->xmat+9*k, m->eq_data+mjNEQDATA*i+3*is_connect);
+          mju_addTo3(end, d->xpos+3*k);
+          xmat_j = d->xmat+9*j;
+          xmat_k = d->xmat+9*k;
+        }
 
         // construct geom
         sz[0] = scl * m->vis.scale.constraint;
 
         START
-        mjv_initGeom(thisgeom, mjGEOM_SPHERE, sz, vec, d->xmat+9*j, m->vis.rgba.connect);
+        mjv_initGeom(thisgeom, mjGEOM_SPHERE, sz, vec, xmat_j, m->vis.rgba.connect);
         if (vopt->label == mjLABEL_CONSTRAINT) {
           makeLabel(m, mjOBJ_EQUALITY, i, thisgeom->label);
         }
         FINISH
 
         START
-        mjv_initGeom(thisgeom, mjGEOM_SPHERE, sz, end, d->xmat+9*k, m->vis.rgba.constraint);
+        mjv_initGeom(thisgeom, mjGEOM_SPHERE, sz, end, xmat_k, m->vis.rgba.constraint);
         if (vopt->label == mjLABEL_CONSTRAINT) {
           makeLabel(m, mjOBJ_EQUALITY, i, thisgeom->label);
         }
@@ -2837,7 +2861,7 @@ static inline mjtNum solve_catenary(mjtNum v, mjtNum h, mjtNum length) {
 
 // points along catenary of given length between x0 and x1, returns number of points
 int mjv_catenary(const mjtNum x0[3], const mjtNum x1[3], const mjtNum gravity[3], mjtNum length,
-                 mjtNum catenary[3*mjNCATENARY]) {
+                 mjtNum* catenary, int ncatenary) {
   mjtNum dist = mju_dist3(x0, x1);
 
   // tendon is stretched longer than length: draw straight line
@@ -2897,7 +2921,7 @@ int mjv_catenary(const mjtNum x0[3], const mjtNum x1[3], const mjtNum gravity[3]
       return 3;
     }
 
-    // compute catenary: mjNCATENARY points
+    // compute full catenary: ncatenary points
     else {
       // b*h: scaled catenary flatness
       mjtNum bh = solve_catenary(v, h, length) * h;
@@ -2910,9 +2934,9 @@ int mjv_catenary(const mjtNum x0[3], const mjtNum x1[3], const mjtNum gravity[3]
       mju_copy3(catenary+0, x0);
 
       // hanging points
-      for (int i=1; i < mjNCATENARY-1; i++) {
+      for (int i=1; i < ncatenary-1; i++) {
         // linearly spaced horizontal offset
-        mjtNum horizontal = i*h/mjNCATENARY;
+        mjtNum horizontal = i*h/ncatenary;
         mju_addScl3(catenary+3*i, x0, across, horizontal);
 
         // vertical offset, evaluate catenary values
@@ -2921,9 +2945,9 @@ int mjv_catenary(const mjtNum x0[3], const mjtNum x1[3], const mjtNum gravity[3]
       }
 
       // end point
-      mju_copy3(catenary+3*(mjNCATENARY-1), x1);
+      mju_copy3(catenary+3*(ncatenary-1), x1);
 
-      return mjNCATENARY;
+      return ncatenary;
     }
   }
 

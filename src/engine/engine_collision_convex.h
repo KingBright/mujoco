@@ -45,13 +45,16 @@ struct _mjCCDObj {
   const mjModel* model;
   const mjData* data;
   int geom;
+  int geom_type;
   int meshindex;
   int flex;
   int elem;
   int vert;
   mjtNum margin;
   mjtNum rotate[4];
-  mjtNum x0[3];  // initial guess of the witness point
+  void (*center)(mjtNum res[3], const struct _mjCCDObj* obj);
+  void (*support)(mjtNum res[3], struct _mjCCDObj* obj, const mjtNum dir[3]);
+  mjtNum prism[6][3];  // for hfield
 };
 typedef struct _mjCCDObj mjCCDObj;
 

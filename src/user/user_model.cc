@@ -19,16 +19,17 @@
 #include <cmath>
 #include <array>
 #include <csetjmp>
-#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <mujoco/mjdata.h>
@@ -55,6 +56,65 @@ namespace mju = ::mujoco::util;
 using std::string;
 using std::vector;
 constexpr int kMaxCompilerThreads = 16;
+
+
+
+//---------------------------------- LOCAL UTILITY FUNCTIONS ---------------------------------------
+
+constexpr double kFrameEps = 1e-6;  // difference below which frames are considered equal
+
+// return true if two 3-vectors are element-wise less than kFrameEps apart
+template <typename T>
+bool IsSameVec(const T pos1[3], const T pos2[3]) {
+  static_assert(std::is_floating_point_v<T>);
+  return std::abs(pos1[0] - pos2[0]) < kFrameEps &&
+         std::abs(pos1[1] - pos2[1]) < kFrameEps &&
+         std::abs(pos1[2] - pos2[2]) < kFrameEps;
+}
+
+// return true if two quaternions are element-wise less than kFrameEps apart, including double-cover
+template <typename T>
+bool IsSameQuat(const T quat1[4], const T quat2[4]) {
+  static_assert(std::is_floating_point_v<T>);
+  bool same_quat_minus = std::abs(quat1[0] - quat2[0]) < kFrameEps &&
+                         std::abs(quat1[1] - quat2[1]) < kFrameEps &&
+                         std::abs(quat1[2] - quat2[2]) < kFrameEps &&
+                         std::abs(quat1[3] - quat2[3]) < kFrameEps;
+
+  bool same_quat_plus = std::abs(quat1[0] + quat2[0]) < kFrameEps &&
+                        std::abs(quat1[1] + quat2[1]) < kFrameEps &&
+                        std::abs(quat1[2] + quat2[2]) < kFrameEps &&
+                        std::abs(quat1[3] + quat2[3]) < kFrameEps;
+
+  return same_quat_minus || same_quat_plus;
+}
+
+
+// compare two poses
+template <typename T>
+bool IsSamePose(const T pos1[3], const T pos2[3], const T quat1[4], const T quat2[4]) {
+  // check position if given
+  if (pos1 && pos2 && !IsSameVec(pos1, pos2)) {
+    return false;
+  }
+
+  // check orientation if given
+  if (quat1 && quat2 && !IsSameQuat(quat1, quat2)) {
+    return false;
+  }
+
+  return true;
+}
+
+// detect null pose
+template <typename T>
+bool IsNullPose(const T pos[3], const T quat[4]) {
+  T zero[3] = {0, 0, 0};
+  T qunit[4] = {1, 0, 0, 0};
+  return IsSamePose(pos, zero, quat, qunit);
+}
+
+
 }  // namespace
 
 //---------------------------------- CONSTRUCTOR AND DESTRUCTOR ------------------------------------
@@ -105,9 +165,6 @@ mjCModel::mjCModel() {
 
   // point to model from spec
   PointToLocal();
-
-  // this class allocated the plugins
-  plugin_owner = true;
 }
 
 
@@ -121,7 +178,6 @@ mjCModel::mjCModel(const mjCModel& other) {
 
 mjCModel& mjCModel::operator=(const mjCModel& other) {
   if (this != &other) {
-    plugin_owner = false;
     this->spec = other.spec;
     *static_cast<mjCModel_*>(this) = static_cast<const mjCModel_&>(other);
     *static_cast<mjSpec*>(this) = static_cast<const mjSpec&>(other);
@@ -132,6 +188,9 @@ mjCModel& mjCModel::operator=(const mjCModel& other) {
 
     // add everything else
     *this += other;
+
+    // add keyframes
+    CopyList(keys_, other.keys_);
 
     // create new default tree
     mjCDef* subtree = new mjCDef(*other.defaults_[0]);
@@ -167,6 +226,7 @@ void mjCModel::CopyList(std::vector<T*>& dest,
       continue;
     }
     // copy the element from the other model to this model
+    source[i]->ForgetKeyframes();
     dest.push_back(candidate);
     dest.back()->model = this;
     dest.back()->id = -1;
@@ -203,7 +263,87 @@ void mjCModel::ResetTreeLists() {
 
 
 
+// save associated state addresses in related elements
+void mjCModel::SaveDofOffsets() {
+  int qposadr = 0;
+  int dofadr = 0;
+  int actadr = 0;
+  int nmocap = 0;
+
+  for (auto joint : joints_) {
+    joint->qposadr_ = qposadr;
+    joint->dofadr_ = dofadr;
+    qposadr += joint->nq();
+    dofadr += joint->nv();
+  }
+
+  for (auto actuator : actuators_) {
+    if (actuator->spec.actdim > 0) {
+      actuator->actdim_ = actuator->spec.actdim;
+    } else {
+      actuator->actdim_ = (actuator->spec.dyntype != mjDYN_NONE);
+    }
+    actuator->actadr_ = actuator->actdim_ ? actadr : -1;
+    actadr += actuator->actdim_;
+  }
+
+  for (mjCBody* body : bodies_) {
+    if (body->spec.mocap) {
+      body->mocapid = nmocap;
+      nmocap++;
+    } else {
+      body->mocapid = -1;
+    }
+  }
+}
+
+template <class T>
+void mjCModel::CopyPlugin(std::vector<mjCPlugin*>& dest,
+                          const std::vector<mjCPlugin*>& source,
+                          const std::vector<T*>& list) {
+  // store elements that reference a plugin instance
+  std::unordered_map<std::string, T*> instances;
+  for (const auto& element : list) {
+    if (!element->plugin_instance_name.empty()) {
+      instances[element->plugin_instance_name] = element;
+    }
+  }
+
+  // only copy plugins that are referenced
+  for (const auto& plugin : source) {
+    if (plugin->name.empty() && plugin->model == this) {
+      continue;
+    }
+    mjCPlugin* candidate = new mjCPlugin(*plugin);
+    candidate->model = this;
+    candidate->NameSpace(plugin->model);
+    bool referenced = instances.find(candidate->name) != instances.end();
+    auto same_name = [candidate](const mjCPlugin* dest) { return dest->name == candidate->name; };
+    bool instance_exists = std::find_if(dest.begin(), dest.end(), same_name) != dest.end();
+    if (referenced && !instance_exists) {
+      dest.push_back(candidate);
+      instances.at(candidate->name)->spec.plugin.element = candidate;
+    } else {
+      delete candidate;
+    }
+  }
+}
+
 mjCModel& mjCModel::operator+=(const mjCModel& other) {
+  // TODO: use compiler settings stored in specs_ during compilation
+  std::string msg = "cannot attach mjSpecs with incompatible compiler/";
+  if (other.spec.degree != spec.degree) {
+    throw mjCError(nullptr, (msg + "angle attribute").c_str());
+  }
+  if (other.spec.autolimits != spec.autolimits) {
+    throw mjCError(nullptr, (msg + "autolimits attribute").c_str());
+  }
+  if (other.spec.eulerseq[0] != spec.eulerseq[0] ||
+      other.spec.eulerseq[1] != spec.eulerseq[1] ||
+      other.spec.eulerseq[2] != spec.eulerseq[2]) {
+    throw mjCError(nullptr, (msg + "eulerseq attribute").c_str());
+  }
+
   // create global lists
   mjCBody *world = bodies_[0];
   if (compiled) {
@@ -221,7 +361,9 @@ mjCModel& mjCModel::operator+=(const mjCModel& other) {
     CopyList(hfields_, other.hfields_);
     CopyList(textures_, other.textures_);
     CopyList(materials_, other.materials_);
-    CopyList(keys_, other.keys_);
+    for (const auto& key : other.key_pending_) {
+      key_pending_.push_back(key);
+    }
   }
   CopyList(flexes_, other.flexes_);
   CopyList(pairs_, other.pairs_);
@@ -234,9 +376,15 @@ mjCModel& mjCModel::operator+=(const mjCModel& other) {
   CopyList(texts_, other.texts_);
   CopyList(tuples_, other.tuples_);
 
-  // plugins are global
-  plugins_ = other.plugins_;
-  active_plugins_ = other.active_plugins_;
+  // create new plugins and map them
+  CopyPlugin(plugins_, other.plugins_, bodies_);
+  CopyPlugin(plugins_, other.plugins_, geoms_);
+  CopyPlugin(plugins_, other.plugins_, meshes_);
+  CopyPlugin(plugins_, other.plugins_, actuators_);
+  CopyPlugin(plugins_, other.plugins_, sensors_);
+  for (const auto& active_plugin : other.active_plugins_) {
+    active_plugins_.emplace_back(active_plugin);
+  }
 
   // restore to the original state
   if (!compiled) {
@@ -282,6 +430,16 @@ void mjCModel::RemoveFromList(std::vector<T*>& list, const mjCModel& other) {
 
 
 
+template <>
+void mjCModel::DeleteAll<mjCKey>(std::vector<mjCKey*>& elements) {
+  for (mjCKey* element : elements) {
+    delete element;
+  }
+  elements.clear();
+}
+
+
+
 mjCModel& mjCModel::operator-=(const mjCBody& subtree) {
   mjCModel oldmodel(*this);
 
@@ -291,14 +449,25 @@ mjCModel& mjCModel::operator-=(const mjCBody& subtree) {
     oldmodel.ProcessLists(/*checkrepeat=*/false);
   }
 
+  // create global lists in this model if not compiled
+  if (!IsCompiled()) {
+    MakeLists(bodies_[0]);
+    ProcessLists(/*checkrepeat=*/false);
+  }
+
+  // TODO: carry over pending keyframes
+  key_pending_.clear();
+  StoreKeyframes();
+
+  // all keyframes are now pending and they will be resized
+  DeleteAll(keys_);
+
   // remove body from tree
   mjCBody* world = bodies_[0];
   *world -= subtree;
 
-  // create global lists
-  if (compiled) {
-    ResetTreeLists();
-  }
+  // update global lists
+  ResetTreeLists();
   MakeLists(world);
   ProcessLists(/*checkrepeat=*/false);
 
@@ -366,7 +535,7 @@ void mjCModel::DeleteElement(mjsElement* el) {
 
   switch (el->elemtype) {
     case mjOBJ_BODY:
-      throw mjCError(NULL, "bodies cannot be deleted, use detach instead");
+      throw mjCError(nullptr, "bodies cannot be deleted, use detach instead");
       break;
 
     case mjOBJ_GEOM:
@@ -395,6 +564,7 @@ void mjCModel::DeleteElement(mjsElement* el) {
   }
 
   if (compiled) {
+    ResetTreeLists();  // in case of a nested delete
     MakeLists(world);
     ProcessLists(/*checkrepeat=*/false);
   }
@@ -465,6 +635,9 @@ void mjCModel::CopyFromSpec() {
 
 // destructor
 mjCModel::~mjCModel() {
+  // do not rebuild lists if we are in the process of deleting the model
+  compiled = false;
+
   // delete kinematic tree and all objects allocated in it
   delete bodies_[0];
 
@@ -486,10 +659,8 @@ mjCModel::~mjCModel() {
   for (int i=0; i<tuples_.size(); i++) delete tuples_[i];
   for (int i=0; i<keys_.size(); i++) delete keys_[i];
   for (int i=0; i<defaults_.size(); i++) delete defaults_[i];
-
-  if (plugin_owner) {
-    for (int i=0; i<plugins_.size(); i++) delete plugins_[i];
-  }
+  for (int i=0; i<specs_.size(); i++) mj_deleteSpec(specs_[i]);
+  for (int i=0; i<plugins_.size(); i++) delete plugins_[i];
 
   // clear sizes and pointer lists created in Compile
   Clear();
@@ -532,6 +703,7 @@ void mjCModel::Clear() {
   nflexedge = 0;
   nflexelem = 0;
   nflexelemdata = 0;
+  nflexelemedge = 0;
   nflexshelldata = 0;
   nflexevpair = 0;
   nflextexcoord = 0;
@@ -762,15 +934,30 @@ static mjsElement* GetNext(std::vector<T*>& list, mjsElement* child) {
 mjsElement* mjCModel::NextObject(mjsElement* object, mjtObj type) {
   if (type == mjOBJ_UNKNOWN) {
     if (!object) {
-      throw mjCError(NULL, "type must be specified if no element is given");
+      throw mjCError(nullptr, "type must be specified if no element is given");
     } else {
       type = object->elemtype;
     }
   } else if (object && object->elemtype != type) {
-    throw mjCError(NULL, "element is not of requested type");
+    throw mjCError(nullptr, "element is not of requested type");
   }
 
   switch (type) {
+    case mjOBJ_BODY:
+      if (!object) {
+        return bodies_[0]->spec.element;
+      } else if (object == bodies_[0]->spec.element) {
+        return bodies_[0]->NextChild(NULL, type, /*recursive=*/true);
+      } else {
+        return bodies_[0]->NextChild(object, type, /*recursive=*/true);
+      }
+    case mjOBJ_SITE:
+    case mjOBJ_GEOM:
+    case mjOBJ_JOINT:
+    case mjOBJ_CAMERA:
+    case mjOBJ_LIGHT:
+    case mjOBJ_FRAME:
+      return bodies_[0]->NextChild(object, type, /*recursive=*/true);
     case mjOBJ_ACTUATOR:
       return GetNext(actuators_, object);
     case mjOBJ_SENSOR:
@@ -803,6 +990,8 @@ mjsElement* mjCModel::NextObject(mjsElement* object, mjtObj type) {
       return GetNext(textures_, object);
     case mjOBJ_MATERIAL:
       return GetNext(materials_, object);
+    case mjOBJ_PLUGIN:
+      return GetNext(plugins_, object);
     default:
       return nullptr;
   }
@@ -910,33 +1099,61 @@ mjCBase* mjCModel::FindObject(mjtObj type, string name) const {
 
 
 // find body by name
-mjCBody* mjCModel::FindBody(mjCBody* body, std::string name) {
-  if (body->name == name) {
-    return body;
+mjCBase* mjCModel::FindTree(mjCBody* body, mjtObj type, std::string name) {
+  switch (type) {
+    case mjOBJ_BODY:
+      if (body->name == name) {
+        return body;
+      }
+      break;
+    case mjOBJ_SITE:
+      for (auto site : body->sites) {
+        if (site->name == name) {
+          return site;
+        }
+      }
+      break;
+    case mjOBJ_GEOM:
+      for (auto geom : body->geoms) {
+        if (geom->name == name) {
+          return geom;
+        }
+      }
+      break;
+    case mjOBJ_JOINT:
+      for (auto joint : body->joints) {
+        if (joint->name == name) {
+          return joint;
+        }
+      }
+      break;
+    case mjOBJ_CAMERA:
+      for (auto camera : body->cameras) {
+        if (camera->name == name) {
+          return camera;
+        }
+      }
+      break;
+    case mjOBJ_LIGHT:
+      for (auto light : body->lights) {
+        if (light->name == name) {
+          return light;
+        }
+      }
+      break;
+    case mjOBJ_FRAME:
+      for (auto frame : body->frames) {
+        if (frame->name == name) {
+          return frame;
+        }
+      }
+      break;
+    default:
+      return nullptr;
   }
 
   for (auto child : body->bodies) {
-    auto candidate = FindBody(child, name);
-    if (candidate) {
-      return candidate;
-    }
-  }
-
-  return nullptr;
-}
-
-
-
-// find frame by name
-mjCFrame* mjCModel::FindFrame(mjCBody* body, std::string name) const{
-  for (auto frame : body->frames) {
-    if (frame->name == name) {
-      return frame;
-    }
-  }
-
-  for (auto body : body->bodies) {
-    auto candidate = FindFrame(body, name);
+    auto candidate = FindTree(child, type, name);
     if (candidate) {
       return candidate;
     }
@@ -955,29 +1172,6 @@ mjSpec* mjCModel::FindSpec(std::string name) const {
     }
   }
   return nullptr;
-}
-
-
-
-// detect null pose
-bool mjCModel::IsNullPose(const mjtNum* pos, const mjtNum* quat) const {
-  bool result = true;
-
-  // check position if given
-  if (pos) {
-    if (pos[0] || pos[1] || pos[2]) {
-      result = false;
-    }
-  }
-
-  // check orientation if given
-  if (quat) {
-    if (quat[0]!=1 || quat[1] || quat[2] || quat[3]) {
-      result = false;
-    }
-  }
-
-  return result;
 }
 
 
@@ -1120,13 +1314,6 @@ void mjCModel::DeleteAll<mjCTexture>(std::vector<mjCTexture*>& elements) {
   elements.clear();
 }
 
-template <>
-void mjCModel::DeleteAll<mjCKey>(std::vector<mjCKey*>& elements) {
-  for (mjCKey* element : elements) {
-    delete element;
-  }
-  elements.clear();
-}
 
 // set nuser fields
 void mjCModel::SetNuser() {
@@ -1299,34 +1486,6 @@ void mjCModel::IndexAssets(bool discard) {
 
 
 
-// if asset name is missing, set to filename
-template <typename T>
-void mjCModel::SetDefaultNames(std::vector<T*>& assets) {
-  string stripped;
-  std::map<string, std::vector<int>> names;
-
-  // use filename if name is missing
-  for (int i=0; i<assets.size(); i++) {
-    assets[i]->CopyFromSpec();
-    if (assets[i]->name.empty()) {
-      stripped = mjuu_strippath(assets[i]->get_file());
-      assets[i]->name = mjuu_stripext(stripped);
-      names[assets[i]->name].push_back(i);
-    }
-  }
-
-  // add suffix if duplicates
-  for (auto const& [name, indices] : names) {
-    if (indices.size() > 1) {
-      for (int i=0; i<indices.size(); i++) {
-        assets[indices[i]]->name += "_" + std::to_string(i);
-      }
-    }
-  }
-}
-
-
-
 // throw error if a name is missing
 void mjCModel::CheckEmptyNames(void) {
   // meshes
@@ -1364,8 +1523,8 @@ template <typename T>
 static size_t getpathslength(std::vector<T> list) {
   size_t result = 0;
   for (const auto& element : list) {
-    if (!element->get_file().empty()) {
-      result += element->get_file().length() + 1;
+    if (!element->File().empty()) {
+      result += element->File().length() + 1;
     }
   }
 
@@ -1412,13 +1571,13 @@ void mjCModel::SetSizes() {
 
   // nbvh, nbvhstatic, nbvhdynamic
   for (int i=0; i<nbody; i++) {
-    nbvhstatic += bodies_[i]->tree.nbvh;
+    nbvhstatic += bodies_[i]->tree.Nbvh();
   }
   for (int i=0; i<nmesh; i++) {
-    nbvhstatic += meshes_[i]->tree().nbvh;
+    nbvhstatic += meshes_[i]->tree().Nbvh();
   }
   for (int i=0; i<nflex; i++) {
-    nbvhdynamic += flexes_[i]->tree.nbvh;
+    nbvhdynamic += flexes_[i]->tree.Nbvh();
   }
   nbvh = nbvhstatic + nbvhdynamic;
 
@@ -1428,6 +1587,7 @@ void mjCModel::SetSizes() {
     nflexedge += flexes_[i]->nedge;
     nflexelem += flexes_[i]->nelem;
     nflexelemdata += flexes_[i]->nelem * (flexes_[i]->dim + 1);
+    nflexelemedge += flexes_[i]->nelem * mjCFlex::kNumEdges[flexes_[i]->dim - 1];
     nflexshelldata += (int)flexes_[i]->shell.size();
     nflexevpair += (int)flexes_[i]->evpair.size()/2;
   }
@@ -1456,7 +1616,7 @@ void mjCModel::SetSizes() {
   for (int i=0; i<nhfield; i++) nhfielddata += hfields_[i]->nrow * hfields_[i]->ncol;
 
   // ntexdata
-  for (int i=0; i<ntex; i++) ntexdata += 3 * textures_[i]->width * textures_[i]->height;
+  for (int i=0; i<ntex; i++) ntexdata += textures_[i]->nchannel * textures_[i]->width * textures_[i]->height;
 
   // nwrap
   for (int i=0; i<ntendon; i++) nwrap += (int)tendons_[i]->path.size();
@@ -1584,12 +1744,12 @@ void* LRfunc(void* arg) {
   for (int i=larg->start; i<larg->start+larg->num; i++) {
     if (i<larg->m->nu) {
       if (!mj_setLengthRange(larg->m, larg->data, i, larg->LRopt, larg->error, larg->error_sz)) {
-        return NULL;
+        return nullptr;
       }
     }
   }
 
-  return NULL;
+  return nullptr;
 }
 
 
@@ -1826,10 +1986,10 @@ template <class T>
 static int pathlist(vector<T*>& list, int adr, int* path_adr, char* paths) {
   for (unsigned int i = 0; i < list.size(); ++i) {
     path_adr[i] = -1;
-    if (!list[i] || list[i]->get_file().empty()) {
+    if (!list[i] || list[i]->File().empty()) {
       continue;
     }
-    adr = addtolist(list[i]->get_file(), adr, &path_adr[i], paths);
+    adr = addtolist(list[i]->File(), adr, &path_adr[i], paths);
   }
 
   return adr;
@@ -1884,17 +2044,17 @@ void mjCModel::CopyTree(mjModel* m) {
     m->body_margin[i] = (mjtNum)pb->margin;
 
     // bounding volume hierarchy
-    m->body_bvhadr[i] = pb->tree.nbvh ? bvh_adr : -1;
-    m->body_bvhnum[i] = pb->tree.nbvh;
-    if (pb->tree.nbvh) {
-      memcpy(m->bvh_aabb + 6*bvh_adr, pb->tree.bvh.data(), 6*pb->tree.nbvh*sizeof(mjtNum));
-      memcpy(m->bvh_child + 2*bvh_adr, pb->tree.child.data(), 2*pb->tree.nbvh*sizeof(int));
-      memcpy(m->bvh_depth + bvh_adr, pb->tree.level.data(), pb->tree.nbvh*sizeof(int));
-      for (int i=0; i<pb->tree.nbvh; i++) {
-        m->bvh_nodeid[i + bvh_adr] = pb->tree.nodeid[i] ? *(pb->tree.nodeid[i]) : -1;
+    m->body_bvhadr[i] = pb->tree.Nbvh() ? bvh_adr : -1;
+    m->body_bvhnum[i] = pb->tree.Nbvh();
+    if (pb->tree.Nbvh()) {
+      memcpy(m->bvh_aabb + 6*bvh_adr, pb->tree.Bvh().data(), 6*pb->tree.Nbvh()*sizeof(mjtNum));
+      memcpy(m->bvh_child + 2*bvh_adr, pb->tree.Child().data(), 2*pb->tree.Nbvh()*sizeof(int));
+      memcpy(m->bvh_depth + bvh_adr, pb->tree.Level().data(), pb->tree.Nbvh()*sizeof(int));
+      for (int i=0; i<pb->tree.Nbvh(); i++) {
+        m->bvh_nodeid[i + bvh_adr] = pb->tree.Nodeid(i) ? *(pb->tree.Nodeid(i)) : -1;
       }
     }
-    bvh_adr += pb->tree.nbvh;
+    bvh_adr += pb->tree.Nbvh();
 
     // count free joints
     int cntfree = 0;
@@ -1921,16 +2081,25 @@ void mjCModel::CopyTree(mjModel* m) {
     pb->lastdof = par->lastdof;
 
     // set sameframe
-    m->body_sameframe[i] = IsNullPose(m->body_ipos+3*i, m->body_iquat+4*i);
+    mjtSameFrame sameframe;
+    mjtNum* nullnum = static_cast<mjtNum*>(nullptr);
+    if (IsNullPose(m->body_ipos+3*i, m->body_iquat+4*i)) {
+      sameframe = mjSAMEFRAME_BODY;
+    } else if (IsNullPose(nullnum, m->body_iquat+4*i)) {
+      sameframe = mjSAMEFRAME_BODYROT;
+    } else {
+      sameframe = mjSAMEFRAME_NONE;
+    }
+    m->body_sameframe[i] = sameframe;
 
     // init simple: sameframe, and (self-root, or parent is fixed child of world)
-    int j = m->body_parentid[i];
-    m->body_simple[i] = (m->body_sameframe[i] &&
+    int parentid = m->body_parentid[i];
+    m->body_simple[i] = (sameframe == mjSAMEFRAME_BODY &&
                          (m->body_rootid[i]==i ||
-                          (m->body_parentid[j]==0 &&
-                           m->body_dofnum[j]==0)));
+                          (m->body_parentid[parentid]==0 &&
+                           m->body_dofnum[parentid]==0)));
 
-    // parent is not simple (unless world)
+    // a parent body is never simple (unless world)
     if (m->body_parentid[i]>0) {
       m->body_simple[m->body_parentid[i]] = 0;
     }
@@ -1964,12 +2133,11 @@ void mjCModel::CopyTree(mjModel* m) {
       mjuu_copyvec(m->jnt_user+nuser_jnt*jid, pj->get_userdata().data(), nuser_jnt);
 
       // not simple if: rotation already found, or pos not zero, or mis-aligned axis
-      if (rotfound ||
-          !IsNullPose(m->jnt_pos+3*jid, NULL) ||
-          ((pj->type==mjJNT_HINGE || pj->type==mjJNT_SLIDE) &&
-           ((std::abs(pj->axis[0])>mjEPS) +
-            (std::abs(pj->axis[1])>mjEPS) +
-            (std::abs(pj->axis[2])>mjEPS)) > 1)) {
+      bool axis_aligned = ((std::abs(pj->axis[0]) > mjEPS) +
+                           (std::abs(pj->axis[1]) > mjEPS) +
+                           (std::abs(pj->axis[2]) > mjEPS)) == 1;
+      if (rotfound || !IsNullPose(m->jnt_pos+3*jid, nullnum) ||
+          ((pj->type == mjJNT_HINGE || pj->type == mjJNT_SLIDE) && !axis_aligned)) {
         m->body_simple[i] = 0;
       }
 
@@ -2033,8 +2201,8 @@ void mjCModel::CopyTree(mjModel* m) {
       m->body_simple[i] = 2;
       for (int j=0; j<(int)pb->joints.size(); j++) {
         if (pb->joints[j]->type!=mjJNT_SLIDE) {
-        m->body_simple[i] = 1;
-        break;
+          m->body_simple[i] = 1;
+          break;
         }
       }
     }
@@ -2076,19 +2244,19 @@ void mjCModel::CopyTree(mjModel* m) {
       mjuu_copyvec(m->geom_rgba+4*gid, pg->rgba, 4);
 
       // determine sameframe
+      double* nulldouble = static_cast<double*>(nullptr);
       if (IsNullPose(m->geom_pos+3*gid, m->geom_quat+4*gid)) {
-        m->geom_sameframe[gid] = 1;
-      } else if (pg->pos[0]==pb->ipos[0] &&
-                 pg->pos[1]==pb->ipos[1] &&
-                 pg->pos[2]==pb->ipos[2] &&
-                 pg->quat[0]==pb->iquat[0] &&
-                 pg->quat[1]==pb->iquat[1] &&
-                 pg->quat[2]==pb->iquat[2] &&
-                 pg->quat[3]==pb->iquat[3]) {
-        m->geom_sameframe[gid] = 2;
+        sameframe = mjSAMEFRAME_BODY;
+      } else if (IsNullPose(nullnum, m->geom_quat+4*gid)) {
+        sameframe = mjSAMEFRAME_BODYROT;
+      } else if (IsSamePose(pg->pos, pb->ipos, pg->quat, pb->iquat)) {
+        sameframe = mjSAMEFRAME_INERTIA;
+      } else if (IsSamePose(nulldouble, nulldouble, pg->quat, pb->iquat)) {
+        sameframe = mjSAMEFRAME_INERTIAROT;
       } else {
-        m->geom_sameframe[gid] = 0;
+        sameframe = mjSAMEFRAME_NONE;
       }
+      m->geom_sameframe[gid] = sameframe;
 
       // compute rbound
       m->geom_rbound[gid] = (mjtNum)pg->GetRBound();
@@ -2112,19 +2280,19 @@ void mjCModel::CopyTree(mjModel* m) {
       mjuu_copyvec(m->site_rgba+4*sid, ps->rgba, 4);
 
       // determine sameframe
+      double* nulldouble = static_cast<double*>(nullptr);
       if (IsNullPose(m->site_pos+3*sid, m->site_quat+4*sid)) {
-        m->site_sameframe[sid] = 1;
-      } else if (ps->pos[0]==pb->ipos[0] &&
-                 ps->pos[1]==pb->ipos[1] &&
-                 ps->pos[2]==pb->ipos[2] &&
-                 ps->quat[0]==pb->iquat[0] &&
-                 ps->quat[1]==pb->iquat[1] &&
-                 ps->quat[2]==pb->iquat[2] &&
-                 ps->quat[3]==pb->iquat[3]) {
-        m->site_sameframe[sid] = 2;
+        sameframe = mjSAMEFRAME_BODY;
+      } else if (IsNullPose(nullnum, m->site_quat+4*sid)) {
+        sameframe = mjSAMEFRAME_BODYROT;
+      } else if (IsSamePose(ps->pos, pb->ipos, ps->quat, pb->iquat)) {
+        sameframe = mjSAMEFRAME_INERTIA;
+      } else if (IsSamePose(nulldouble, nulldouble, ps->quat, pb->iquat)) {
+        sameframe = mjSAMEFRAME_INERTIAROT;
       } else {
-        m->site_sameframe[sid] = 0;
+        sameframe = mjSAMEFRAME_NONE;
       }
+      m->site_sameframe[sid] = sameframe;
     }
 
     // loop over cameras for this body
@@ -2263,6 +2431,20 @@ void mjCModel::CopyTree(mjModel* m) {
     }
     m->dof_simplenum[i] = count;
   }
+
+  // compute nC
+  int nOD = 0;  // number of off-diagonal (non-simple) parent dofs
+  for (int i=0; i<nv; i++) {
+    // count ancestor (off-diagonal) dofs
+    if (!m->dof_simplenum[i]) {
+      int j = i;
+      while (j >= 0) {
+        if (j != i) nOD++;
+        j = m->dof_parentid[j];
+      }
+    }
+  }
+   m->nC = nC = 2 * nOD + nv;
 }
 
 
@@ -2270,7 +2452,7 @@ void mjCModel::CopyTree(mjModel* m) {
 // copy objects outside kinematic tree
 void mjCModel::CopyObjects(mjModel* m) {
   int adr, bone_adr, vert_adr, normal_adr, face_adr, texcoord_adr;
-  int edge_adr, elem_adr, elemdata_adr, shelldata_adr, evpair_adr;
+  int edge_adr, elem_adr, elemdata_adr, elemedge_adr, shelldata_adr, evpair_adr;
   int bonevert_adr, graph_adr, data_adr, bvh_adr;
 
   // sizes outside call to mj_makeModel
@@ -2307,9 +2489,9 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->mesh_faceadr[i] = face_adr;
     m->mesh_facenum[i] = pme->nface();
     m->mesh_graphadr[i] = (pme->szgraph() ? graph_adr : -1);
-    m->mesh_bvhnum[i] = pme->tree().nbvh;
-    m->mesh_bvhadr[i] = pme->tree().nbvh ? bvh_adr : -1;
-    mjuu_copyvec(&m->mesh_scale[3 * i], pme->get_scale(), 3);
+    m->mesh_bvhnum[i] = pme->tree().Nbvh();
+    m->mesh_bvhadr[i] = pme->tree().Nbvh() ? bvh_adr : -1;
+    mjuu_copyvec(&m->mesh_scale[3 * i], pme->Scale(), 3);
     mjuu_copyvec(&m->mesh_pos[3 * i], pme->GetOffsetPosPtr(), 3);
     mjuu_copyvec(&m->mesh_quat[4 * i], pme->GetOffsetQuatPtr(), 4);
 
@@ -2329,12 +2511,12 @@ void mjCModel::CopyObjects(mjModel* m) {
     }
 
     // copy bvh data
-    if (pme->tree().nbvh) {
-      memcpy(m->bvh_aabb + 6*bvh_adr, pme->tree().bvh.data(), 6*pme->tree().nbvh*sizeof(mjtNum));
-      memcpy(m->bvh_child + 2*bvh_adr, pme->tree().child.data(), 2*pme->tree().nbvh*sizeof(int));
-      memcpy(m->bvh_depth + bvh_adr, pme->tree().level.data(), pme->tree().nbvh*sizeof(int));
-      for (int j=0; j<pme->tree().nbvh; j++) {
-        m->bvh_nodeid[j + bvh_adr] = pme->tree().nodeid[j] ? *(pme->tree().nodeid[j]) : -1;
+    if (pme->tree().Nbvh()) {
+      memcpy(m->bvh_aabb + 6*bvh_adr, pme->tree().Bvh().data(), 6*pme->tree().Nbvh()*sizeof(mjtNum));
+      memcpy(m->bvh_child + 2*bvh_adr, pme->tree().Child().data(), 2*pme->tree().Nbvh()*sizeof(int));
+      memcpy(m->bvh_depth + bvh_adr, pme->tree().Level().data(), pme->tree().Nbvh()*sizeof(int));
+      for (int j=0; j<pme->tree().Nbvh(); j++) {
+        m->bvh_nodeid[j + bvh_adr] = pme->tree().Nodeid(j) ? *(pme->tree().Nodeid(j)) : -1;
       }
     }
 
@@ -2344,7 +2526,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     texcoord_adr += (pme->HasTexcoord() ? pme->ntexcoord() : 0);
     face_adr += pme->nface();
     graph_adr += pme->szgraph();
-    bvh_adr += pme->tree().nbvh;
+    bvh_adr += pme->tree().Nbvh();
   }
 
   // flexes
@@ -2352,6 +2534,7 @@ void mjCModel::CopyObjects(mjModel* m) {
   edge_adr = 0;
   elem_adr = 0;
   elemdata_adr = 0;
+  elemedge_adr = 0;
   shelldata_adr = 0;
   evpair_adr = 0;
   texcoord_adr = 0;
@@ -2375,6 +2558,14 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->flex_gap[i] = (mjtNum)pfl->gap;
     mjuu_copyvec(m->flex_rgba + 4 * i, pfl->rgba, 4);
 
+    // elasticity
+    if (!pfl->stiffness.empty()) {
+      mjuu_copyvec(m->flex_stiffness + 21 * elem_adr, pfl->stiffness.data(), pfl->stiffness.size());
+    } else {
+      mjuu_zerovec(m->flex_stiffness + 21 * elem_adr, 21 * pfl->nelem);
+    }
+    m->flex_damping[i] = (mjtNum)pfl->damping;
+
     // set fields: mesh-like
     m->flex_dim[i] = pfl->dim;
     m->flex_vertadr[i] = vert_adr;
@@ -2383,6 +2574,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->flex_edgenum[i] = pfl->nedge;
     m->flex_elemadr[i] = elem_adr;
     m->flex_elemdataadr[i] = elemdata_adr;
+    m->flex_elemedgeadr[i] = elemedge_adr;
     m->flex_shellnum[i] = (int)pfl->shell.size()/pfl->dim;
     m->flex_shelldataadr[i] = m->flex_shellnum[i] ? shelldata_adr : -1;
     if (pfl->evpair.empty()) {
@@ -2402,6 +2594,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     }
     m->flex_elemnum[i] = pfl->nelem;
     memcpy(m->flex_elem + elemdata_adr, pfl->elem_.data(), pfl->elem_.size()*sizeof(int));
+    memcpy(m->flex_elemedge + elemedge_adr, pfl->edgeidx_.data(), pfl->edgeidx_.size()*sizeof(int));
     memcpy(m->flex_elemlayer + elem_adr, pfl->elemlayer.data(), pfl->nelem*sizeof(int));
     if (m->flex_shellnum[i]) {
       memcpy(m->flex_shell + shelldata_adr, pfl->shell.data(), pfl->shell.size()*sizeof(int));
@@ -2414,8 +2607,8 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->flex_flatskin[i] = pfl->flatskin;
     m->flex_selfcollide[i] = pfl->selfcollide;
     m->flex_activelayers[i] = pfl->activelayers;
-    m->flex_bvhnum[i] = pfl->tree.nbvh;
-    m->flex_bvhadr[i] = pfl->tree.nbvh ? bvh_adr : -1;
+    m->flex_bvhnum[i] = pfl->tree.Nbvh();
+    m->flex_bvhadr[i] = pfl->tree.Nbvh() ? bvh_adr : -1;
 
     // find equality constraint referencing this flex
     m->flex_edgeequality[i] = 0;
@@ -2427,11 +2620,11 @@ void mjCModel::CopyObjects(mjModel* m) {
     }
 
     // copy bvh data (flex aabb computed dynamically in mjData)
-    if (pfl->tree.nbvh) {
-      memcpy(m->bvh_child + 2*bvh_adr, pfl->tree.child.data(), 2*pfl->tree.nbvh*sizeof(int));
-      memcpy(m->bvh_depth + bvh_adr, pfl->tree.level.data(), pfl->tree.nbvh*sizeof(int));
-      for (int i=0; i<pfl->tree.nbvh; i++) {
-        m->bvh_nodeid[i+ bvh_adr] = pfl->tree.nodeid[i] ? *(pfl->tree.nodeid[i]) : -1;
+    if (pfl->tree.Nbvh()) {
+      memcpy(m->bvh_child + 2*bvh_adr, pfl->tree.Child().data(), 2*pfl->tree.Nbvh()*sizeof(int));
+      memcpy(m->bvh_depth + bvh_adr, pfl->tree.Level().data(), pfl->tree.Nbvh()*sizeof(int));
+      for (int i=0; i<pfl->tree.Nbvh(); i++) {
+        m->bvh_nodeid[i+ bvh_adr] = pfl->tree.Nodeid(i) ? *(pfl->tree.Nodeid(i)) : -1;
       }
     }
 
@@ -2440,7 +2633,7 @@ void mjCModel::CopyObjects(mjModel* m) {
       mjuu_zerovec(m->flex_vert + 3*vert_adr, 3*pfl->nvert);
     }
     else {
-      memcpy(m->flex_vert + 3*vert_adr, pfl->vert_.data(), 3*pfl->nvert*sizeof(mjtNum));
+      mjuu_copyvec(m->flex_vert + 3*vert_adr, pfl->vert_.data(), 3*pfl->nvert);
     }
 
     // copy or set vertbodyid
@@ -2473,10 +2666,11 @@ void mjCModel::CopyObjects(mjModel* m) {
     edge_adr += pfl->nedge;
     elem_adr += pfl->nelem;
     elemdata_adr += (pfl->dim+1) * pfl->nelem;
+    elemedge_adr += (pfl->kNumEdges[pfl->dim-1]) * pfl->nelem;
     shelldata_adr += (int)pfl->shell.size();
     evpair_adr += (int)pfl->evpair.size()/2;
     texcoord_adr += (int)pfl->texcoord_.size()/2;
-    bvh_adr += pfl->tree.nbvh;
+    bvh_adr += pfl->tree.Nbvh();
   }
 
   // skins
@@ -2573,7 +2767,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->tex_adr[i] = data_adr;
 
     // copy rgb data
-    memcpy(m->tex_data + data_adr, ptex->data.data(),
+    memcpy(m->tex_data + data_adr, ptex->data_.data(),
            ptex->nchannel * ptex->width * ptex->height);
 
     // advance counter
@@ -2628,6 +2822,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->eq_type[i] = peq->type;
     m->eq_obj1id[i] = peq->obj1id;
     m->eq_obj2id[i] = peq->obj2id;
+    m->eq_objtype[i] = peq->objtype;
     m->eq_active0[i] = peq->active;
     mjuu_copyvec(m->eq_solref+mjNREF*i, peq->solref, mjNREF);
     mjuu_copyvec(m->eq_solimp+mjNIMP*i, peq->solimp, mjNIMP);
@@ -2692,7 +2887,7 @@ void mjCModel::CopyObjects(mjModel* m) {
     m->actuator_actnum[i] = pac->actdim;
     m->actuator_actadr[i] = m->actuator_actnum[i] ? adr : -1;
     pac->actadr_ = m->actuator_actadr[i];
-    pac->actnum_ = m->actuator_actnum[i];
+    pac->actdim_ = m->actuator_actnum[i];
     adr += m->actuator_actnum[i];
     m->actuator_group[i] = pac->group;
     m->actuator_ctrllimited[i] = (mjtByte)pac->is_ctrllimited();
@@ -2826,16 +3021,37 @@ void mjCModel::CopyObjects(mjModel* m) {
 
 
 // save the current state
-void mjCModel::SaveState(const mjtNum* qpos, const mjtNum* qvel, const mjtNum* act) {
+template <class T>
+void mjCModel::SaveState(const std::string& state_name, const T* qpos, const T* qvel, const T* act,
+                         const T* ctrl, const T* mpos, const T* mquat) {
   for (auto joint : joints_) {
-    if (qpos) mjuu_copyvec(joint->qpos, qpos + joint->qposadr_, joint->nq());
-    if (qvel) mjuu_copyvec(joint->qvel, qvel + joint->dofadr_, joint->nv());
+    if (joint->qposadr_ == -1 || joint->dofadr_ == -1) {
+      throw mjCError(nullptr, "SaveState: joint %s has no address", joint->name.c_str());
+    }
+    if (qpos) mjuu_copyvec(joint->qpos(state_name), qpos + joint->qposadr_, joint->nq());
+    if (qvel) mjuu_copyvec(joint->qvel(state_name), qvel + joint->dofadr_, joint->nv());
   }
 
-  for (auto actuator : actuators_) {
-    if (actuator->actadr_ != -1 && act) {
-      actuator->act.assign(actuator->actnum_, 0);
-      mjuu_copyvec(actuator->act.data(), act + actuator->actadr_, actuator->actnum_);
+  for (unsigned int i=0; i<actuators_.size(); i++) {
+    auto actuator = actuators_[i];
+    if (actuator->actadr_ != -1 && actuator->actdim_ != -1 && act) {
+      actuator->act(state_name).assign(actuator->actdim_, 0);
+      mjuu_copyvec(actuator->act(state_name).data(), act + actuator->actadr_, actuator->actdim_);
+    }
+    if (ctrl) {
+      actuator->ctrl(state_name) = ctrl[i];
+    }
+  }
+
+  for (auto body : bodies_) {
+    if (!body->spec.mocap) {
+      continue;
+    }
+    if (mpos) {
+      mjuu_copyvec(body->mpos(state_name), mpos + 3*body->mocapid, 3);
+    }
+    if (mquat) {
+      mjuu_copyvec(body->mquat(state_name), mquat + 4*body->mocapid, 4);
     }
   }
 }
@@ -2855,20 +3071,101 @@ void mjCModel::MakeData(const mjModel* m, mjData** dest) {
 
 
 // restore the previous state
-void mjCModel::RestoreState(mjtNum* qpos, mjtNum* qvel, mjtNum* act) {
+template <class T>
+void mjCModel::RestoreState(const std::string& state_name, const mjtNum* pos0,
+                            const mjtNum* mpos0, const mjtNum* mquat0, T* qpos,
+                            T* qvel, T* act, T* ctrl, T* mpos, T* mquat) {
   for (auto joint : joints_) {
-    if (mjuu_defined(joint->qpos[0]) && qpos) {
-      mjuu_copyvec(qpos + joint->qposadr_, joint->qpos, joint->nq());
+    if (qpos) {
+      if (mjuu_defined(joint->qpos(state_name)[0])) {
+        mjuu_copyvec(qpos + joint->qposadr_, joint->qpos(state_name), joint->nq());
+      } else {
+        mjuu_copyvec(qpos + joint->qposadr_, pos0 + joint->qposadr_, joint->nq());
+      }
     }
-    if (mjuu_defined(joint->qvel[0]) && qvel) {
-      mjuu_copyvec(qvel + joint->dofadr_, joint->qvel, joint->nv());
+    if (mjuu_defined(joint->qvel(state_name)[0]) && qvel) {
+      mjuu_copyvec(qvel + joint->dofadr_, joint->qvel(state_name), joint->nv());
     }
   }
 
-  for (auto actuator : actuators_) {
-    if (mjuu_defined(actuator->act[0]) && act) {
-      mjuu_copyvec(act + actuator->actadr_, actuator->act.data(), actuator->actnum_);
+  // restore act
+  for (unsigned int i=0; i<actuators_.size(); i++) {
+    auto actuator = actuators_[i];
+    if (!actuator->act(state_name).empty() && mjuu_defined(actuator->act(state_name)[0]) && act) {
+      mjuu_copyvec(act + actuator->actadr_, actuator->act(state_name).data(), actuator->actdim_);
     }
+    if (ctrl) {
+      ctrl[i] = mjuu_defined(actuator->ctrl(state_name)) ? actuator->ctrl(state_name) : 0;
+    }
+  }
+
+  for (unsigned int i=0; i<bodies_.size(); i++) {
+    auto body = bodies_[i];
+    if (!body->mocap) {
+      continue;
+    }
+    if (mpos) {
+      if (mjuu_defined(body->mpos(state_name)[0])) {
+        mjuu_copyvec(mpos + 3*body->mocapid, body->mpos(state_name), 3);
+      } else {
+        mjuu_copyvec(mpos + 3*body->mocapid, mpos0 + 3*i, 3);
+      }
+    }
+    if (mquat) {
+      if (mjuu_defined(body->mquat(state_name)[0])) {
+        mjuu_copyvec(mquat + 4*body->mocapid, body->mquat(state_name), 4);
+      } else {
+        mjuu_copyvec(mquat + 4*body->mocapid, mquat0 + 4*i, 4);
+      }
+    }
+  }
+}
+
+// force explicit instantiations
+template void mjCModel::SaveState<mjtNum>(
+    const std::string& name, const mjtNum* qpos, const mjtNum* qvel, const mjtNum* act,
+    const mjtNum* ctrl, const mjtNum* mpos, const mjtNum* mquat);
+
+template void mjCModel::RestoreState<mjtNum>(
+    const std::string& name, const mjtNum* qpos0, const mjtNum* mpos0, const mjtNum* mquat0,
+    mjtNum* qpos, mjtNum* qvel, mjtNum* act, mjtNum* ctrl, mjtNum* mpos, mjtNum* mquat);
+
+
+
+// resolve keyframe references
+void mjCModel::StoreKeyframes() {
+  bool resetlists = false;
+
+  // create tree lists if they are empty, occurs if an uncompiled model is attached
+  if (bodies_.size() == 1 && geoms_.empty() && sites_.empty() && joints_.empty() &&
+      cameras_.empty() && lights_.empty() && frames_.empty()) {
+    MakeLists(bodies_[0]);
+    resetlists = true;
+  }
+
+  // do not change the offset computed during compilation in case the user wants to recompile
+  if (!compiled) {
+    SaveDofOffsets();
+  }
+
+  for (auto& key : keys_) {
+    mjKeyInfo info;
+    info.name = prefix + key->name + suffix;
+    info.time = key->spec.time;
+    info.qpos = !key->spec_qpos_.empty();
+    info.qvel = !key->spec_qvel_.empty();
+    info.act = !key->spec_act_.empty();
+    info.ctrl = !key->spec_ctrl_.empty();
+    info.mpos = !key->spec_mpos_.empty();
+    info.mquat = !key->spec_mquat_.empty();
+    key_pending_.push_back(info);
+    SaveState(info.name, key->spec_qpos_.data(), key->spec_qvel_.data(),
+              key->spec_act_.data(), key->spec_ctrl_.data(),
+              key->spec_mpos_.data(), key->spec_mquat_.data());
+  }
+
+  if (resetlists) {
+    ResetTreeLists();
   }
 }
 
@@ -3015,7 +3312,7 @@ void mjCModel::FuseStatic(void) {
         mjuu_copyvec(par->fullinertia, toti, 6);
         const char* err1 = mjuu_fullInertia(par->iquat, par->inertia, par->fullinertia);
         if (err1) {
-          throw mjCError(NULL, "error '%s' in fusing static body inertias", err1);
+          throw mjCError(nullptr, "error '%s' in fusing static body inertias", err1);
         }
       }
     }
@@ -3117,10 +3414,10 @@ void mjCModel::FuseStatic(void) {
     }
 
     // recompute BVH
-    int nbvhfuse = body->tree.nbvh + par->tree.nbvh;
+    int nbvhfuse = body->tree.Nbvh() + par->tree.Nbvh();
     par->ComputeBVH();
-    nbvhstatic += par->tree.nbvh - nbvhfuse;
-    nbvh += par->tree.nbvh - nbvhfuse;
+    nbvhstatic += par->tree.Nbvh() - nbvhfuse;
+    nbvh += par->tree.Nbvh() - nbvhfuse;
 
     //------------- delete body (without deleting children)
 
@@ -3193,7 +3490,7 @@ static void processlist(mjListKeyMap& ids, vector<T*>& list,
       auto adjacent = std::adjacent_find(allnames.begin(), allnames.end());
       if (adjacent != allnames.end()) {
         string msg = "repeated name '" + *adjacent + "' in " + mju_type2Str(type);
-        throw mjCError(NULL, "%s", msg.c_str());
+        throw mjCError(nullptr, "%s", msg.c_str());
       }
     }
   }
@@ -3400,6 +3697,86 @@ void mjCModel::CompileMeshes(const mjVFS* vfs) {
 
 
 
+// convert pending keyframes info to actual keyframes
+void mjCModel::ResolveKeyframes(const mjModel* m) {
+  if (key_pending_.empty()) {
+    return;
+  }
+
+  // store dof offsets in joints and actuators
+  SaveDofOffsets();
+
+  // resize existing keyframes to the new state, fill in missing default values
+  for (unsigned int i = 0; i < nkey - key_pending_.size(); i++) {
+    mjCKey* key = keys_[i];
+    if (!key->spec_qpos_.empty()) {
+      int nq0 = key->spec_qpos_.size();
+      key->spec_qpos_.resize(nq);
+      for (int i=nq0; i<m->nq; i++) {
+        key->spec_qpos_[i] = (double)m->qpos0[i];
+      }
+    }
+    if (!key->spec_qvel_.empty()) {
+      key->spec_qvel_.resize(nv);
+    }
+    if (!key->spec_act_.empty()) {
+      key->spec_act_.resize(na);
+    }
+    if (!key->spec_ctrl_.empty()) {
+      key->spec_ctrl_.resize(nu);
+    }
+    if (!key->spec_mpos_.empty()) {
+      int nmocap0 = key->spec_mpos_.size() / 3;
+      key->spec_mpos_.resize(3*nmocap);
+      for (unsigned int j = 0; j < bodies_.size(); j++) {
+        if (bodies_[j]->mocapid < nmocap0) {
+          continue;
+        }
+        int i = bodies_[j]->mocapid;
+        key->spec_mpos_[3*i+0] = (double)m->body_pos[3*j+0];
+        key->spec_mpos_[3*i+1] = (double)m->body_pos[3*j+1];
+        key->spec_mpos_[3*i+2] = (double)m->body_pos[3*j+2];
+      }
+    }
+    if (!key->spec_mquat_.empty()) {
+      int nmocap0 = key->spec_mquat_.size() / 4;
+      key->spec_mquat_.resize(4*nmocap);
+      for (unsigned int j = 0; j < bodies_.size(); j++) {
+        if (bodies_[j]->mocapid < nmocap0) {
+          continue;
+        }
+        int i = bodies_[j]->mocapid;
+        key->spec_mquat_[4*i+0] = (double)m->body_quat[4*j+0];
+        key->spec_mquat_[4*i+1] = (double)m->body_quat[4*j+1];
+        key->spec_mquat_[4*i+2] = (double)m->body_quat[4*j+2];
+        key->spec_mquat_[4*i+3] = (double)m->body_quat[4*j+3];
+      }
+    }
+  }
+
+  // create new keyframes, fill in missing default values
+  for (const auto& info : key_pending_) {
+    mjCKey* key = (mjCKey*)FindObject(mjOBJ_KEY, info.name);
+    key->name = info.name;
+    key->spec.time = info.time;
+    if (info.qpos) key->spec_qpos_.assign(nq, 0);
+    if (info.qvel) key->spec_qvel_.assign(nv, 0);
+    if (info.act) key->spec_act_.assign(na, 0);
+    if (info.ctrl) key->spec_ctrl_.assign(nu, 0);
+    if (info.mpos) key->spec_mpos_.assign(3*nmocap, 0);
+    if (info.mquat) key->spec_mquat_.assign(4*nmocap, 0);
+    RestoreState(info.name, m->qpos0, m->body_pos, m->body_quat,
+                 key->spec_qpos_.data(), key->spec_qvel_.data(),
+                 key->spec_act_.data(), key->spec_ctrl_.data(),
+                 key->spec_mpos_.data(), key->spec_mquat_.data());
+  }
+
+  // the attached keyframes have been copied into the model
+  key_pending_.clear();
+}
+
+
+
 void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   // check if nan test works
   double test = mjNAN;
@@ -3440,11 +3817,17 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   MakeLists(bodies_[0]);
 
   // fill missing names and check that they are all filled
-  SetDefaultNames(meshes_);
-  SetDefaultNames(skins_);
-  SetDefaultNames(hfields_);
-  SetDefaultNames(textures_);
+  for (const auto& asset : meshes_) asset->CopyFromSpec();
+  for (const auto& asset : skins_) asset->CopyFromSpec();
+  for (const auto& asset : hfields_) asset->CopyFromSpec();
+  for (const auto& asset : textures_) asset->CopyFromSpec();
   CheckEmptyNames();
+
+  // create pending keyframes
+  for (const auto& info : key_pending_) {
+    mjCKey* key = AddKey();
+    key->name = info.name;
+  }
 
   // set object ids, check for repeated names
   ProcessLists();
@@ -3465,7 +3848,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
     if (geoms_[i]->mesh &&
         (geoms_[i]->spec.type==mjGEOM_MESH || geoms_[i]->spec.type==mjGEOM_SDF) &&
         (geoms_[i]->spec.contype || geoms_[i]->spec.conaffinity)) {
-      geoms_[i]->mesh->set_needhull(true);
+      geoms_[i]->mesh->SetNeedHull(true);
     }
   }
 
@@ -3568,7 +3951,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   mj_makeModel(&m,
                nq, nv, nu, na, nbody, nbvh, nbvhstatic, nbvhdynamic, njnt, ngeom, nsite,
                ncam, nlight, nflex, nflexvert, nflexedge, nflexelem,
-               nflexelemdata, nflexshelldata, nflexevpair, nflextexcoord,
+               nflexelemdata, nflexelemedge, nflexshelldata, nflexevpair, nflextexcoord,
                nmesh, nmeshvert, nmeshnormal, nmeshtexcoord, nmeshface, nmeshgraph,
                nskin, nskinvert, nskintexvert, nskinface, nskinbone, nskinbonevert,
                nhfield, nhfielddata, ntex, ntexdata, nmat, npair, nexclude,
@@ -3591,7 +3974,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   {
     int adr = 0;
     for (int i = 0; i < nplugin; ++i) {
-      m->plugin[i] = plugins_[i]->spec.plugin_slot;
+      m->plugin[i] = plugins_[i]->plugin_slot;
       const int size = plugins_[i]->flattened_attributes.size();
       std::memcpy(m->plugin_attr + adr,
                   plugins_[i]->flattened_attributes.data(), size);
@@ -3606,7 +3989,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
     std::vector<std::vector<int>> plugin_to_actuators(nplugin);
     for (int i = 0; i < nu; ++i) {
       if (actuators_[i]->plugin.active) {
-        int actuator_plugin = static_cast<mjCPlugin*>(actuators_[i]->plugin.instance)->id;
+        int actuator_plugin = static_cast<mjCPlugin*>(actuators_[i]->plugin.element)->id;
         m->actuator_plugin[i] = actuator_plugin;
         plugin_to_actuators[actuator_plugin].push_back(i);
       } else {
@@ -3616,7 +3999,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
 
     for (int i = 0; i < nbody; ++i) {
       if (bodies_[i]->plugin.active) {
-        m->body_plugin[i] = static_cast<mjCPlugin*>(bodies_[i]->plugin.instance)->id;
+        m->body_plugin[i] = static_cast<mjCPlugin*>(bodies_[i]->plugin.element)->id;
       } else {
         m->body_plugin[i] = -1;
       }
@@ -3624,7 +4007,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
 
     for (int i = 0; i < ngeom; ++i) {
       if (geoms_[i]->plugin.active) {
-        m->geom_plugin[i] = static_cast<mjCPlugin*>(geoms_[i]->plugin.instance)->id;
+        m->geom_plugin[i] = static_cast<mjCPlugin*>(geoms_[i]->plugin.element)->id;
       } else {
         m->geom_plugin[i] = -1;
       }
@@ -3633,7 +4016,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
     std::vector<std::vector<int>> plugin_to_sensors(nplugin);
     for (int i = 0; i < nsensor; ++i) {
       if (sensors_[i]->type == mjSENS_PLUGIN) {
-        int sensor_plugin = static_cast<mjCPlugin*>(sensors_[i]->plugin.instance)->id;
+        int sensor_plugin = static_cast<mjCPlugin*>(sensors_[i]->plugin.element)->id;
         m->sensor_plugin[i] = sensor_plugin;
         plugin_to_sensors[sensor_plugin].push_back(i);
       } else {
@@ -3670,6 +4053,8 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   }
 
   // keyframe compilation needs access to nq, nv, na, nmocap, qpos0
+  ResolveKeyframes(m);
+
   for (int i=0; i<keys_.size(); i++) {
     keys_[i]->Compile(m);
   }
@@ -3722,7 +4107,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   m->opt.disableflags |= mjDSBL_CONTACT;
   mj_makeRawData(&d, m);
   if (!d) {
-    mj_deleteModel(m);
+    // m will be deleted by the catch statement in mjCModel::Compile()
     throw mjCError(0, "could not create mjData");
   }
   mj_resetData(m, d);
@@ -3758,8 +4143,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   // assert that model has valid references
   const char* validationerr = mj_validateReferences(m);
   if (validationerr) {  // SHOULD NOT OCCUR
-    mj_deleteData(d);
-    mj_deleteModel(m);
+    // m and d will be deleted by the catch statement in mjCModel::Compile()
     throw mjCError(0, "%s", validationerr);
   }
 
@@ -3768,7 +4152,7 @@ void mjCModel::TryCompile(mjModel*& m, mjData*& d, const mjVFS* vfs) {
   d = nullptr;
   d = mj_makeData(m);
   if (!d) {
-    mj_deleteModel(m);
+    // m will be deleted by the catch statement in mjCModel::Compile()
     throw mjCError(0, "could not create mjData");
   }
 
@@ -3813,7 +4197,7 @@ bool mjCModel::CopyBack(const mjModel* m) {
       nmat != m->nmat || ntex != m->ntex || npair!=m->npair || nexclude!=m->nexclude ||
       neq!=m->neq || ntendon!=m->ntendon || nwrap!=m->nwrap || nsensor!=m->nsensor ||
       nnumeric!=m->nnumeric || nnumericdata!=m->nnumericdata || ntext!=m->ntext ||
-      ntextdata!=m->ntextdata || nnames!=m->nnames || nM!=m->nM || nD!=m->nD ||
+      ntextdata!=m->ntextdata || nnames!=m->nnames || nM!=m->nM || nD!=m->nD || nC!=m->nC ||
       nB!=m->nB || nemax!=m->nemax || nconmax!=m->nconmax || njmax!=m->njmax ||
       npaths!=m->npaths) {
     errInfo = mjCError(0, "incompatible models in CopyBack");
@@ -4097,26 +4481,56 @@ bool mjCModel::CopyBack(const mjModel* m) {
   return true;
 }
 
+
+
+void mjCModel::ActivatePlugin(const mjpPlugin* plugin, int slot) {
+  bool already_declared = false;
+  for (const auto& [existing_plugin, existing_slot] : active_plugins_) {
+    if (plugin == existing_plugin) {
+      already_declared = true;
+      break;
+    }
+  }
+  if (!already_declared) {
+    active_plugins_.emplace_back(std::make_pair(plugin, slot));
+  }
+}
+
+
+
 void mjCModel::ResolvePlugin(mjCBase* obj, const std::string& plugin_name,
                              const std::string& plugin_instance_name, mjCPlugin** plugin_instance) {
+  std::string pname = plugin_name;
+
+  // if the plugin name is not specified by the user, infer it from the plugin instance
+  if (plugin_name.empty() && !plugin_instance_name.empty()) {
+    mjCBase* plugin_obj = FindObject(mjOBJ_PLUGIN, plugin_instance_name);
+    if (plugin_obj) {
+      pname = static_cast<mjCPlugin*>(plugin_obj)->plugin_name;
+    } else {
+      throw mjCError(obj, "unrecognized name '%s' for plugin instance",
+                     plugin_instance_name.c_str());
+    }
+  }
+
   // if plugin_name is specified, check if it is in the list of active plugins
   // (in XML, active plugins are those declared as <required>)
   int plugin_slot = -1;
-  if (!plugin_name.empty()) {
+  if (!pname.empty()) {
     for (int i = 0; i < active_plugins_.size(); ++i) {
-      if (active_plugins_[i].first->name == plugin_name) {
+      if (active_plugins_[i].first->name == pname) {
         plugin_slot = active_plugins_[i].second;
         break;
       }
     }
     if (plugin_slot == -1) {
-      throw mjCError(obj, "unrecognized plugin '%s'", plugin_name.c_str());
+      throw mjCError(obj, "unrecognized plugin '%s'", pname.c_str());
     }
   }
 
   // implicit plugin instance
-  if (*plugin_instance && (*plugin_instance)->spec.plugin_slot == -1) {
-      (*plugin_instance)->spec.plugin_slot = plugin_slot;
+  if (*plugin_instance && (*plugin_instance)->plugin_slot == -1) {
+      (*plugin_instance)->plugin_slot = plugin_slot;
       (*plugin_instance)->parent = obj;
   }
 
@@ -4124,14 +4538,15 @@ void mjCModel::ResolvePlugin(mjCBase* obj, const std::string& plugin_name,
   else if (!*plugin_instance) {
     *plugin_instance =
         static_cast<mjCPlugin*>(FindObject(mjOBJ_PLUGIN, plugin_instance_name));
+    (*plugin_instance)->plugin_slot = plugin_slot;
     if (!*plugin_instance) {
       throw mjCError(
           obj, "unrecognized name '%s' for plugin instance", plugin_instance_name.c_str());
     }
-    if (plugin_slot != -1 && plugin_slot != (*plugin_instance)->spec.plugin_slot) {
+    if (plugin_slot != -1 && plugin_slot != (*plugin_instance)->plugin_slot) {
       throw mjCError(
           obj, "'plugin' attribute does not match that of the instance");
     }
-    plugin_slot = (*plugin_instance)->spec.plugin_slot;
+    plugin_slot = (*plugin_instance)->plugin_slot;
   }
 }

@@ -42,6 +42,10 @@ def generate_usd_trajectory(local_args):
     if exp.frame_count < d.time * local_args.framerate:
       exp.update_scene(data=d)
 
+  exp.add_light(pos=(0, 0, 0),
+                intensity=2000,
+                light_type='dome')
+
   exp.save_scene(filetype=local_args.export_extension)
 
 
@@ -75,7 +79,10 @@ if __name__ == '__main__':
   )
 
   parser.add_argument(
-      '--camera_names', type=str, nargs='+', help='cameras to include in usd'
+      '--camera_names',
+      type=str,
+      nargs='+',
+      help='cameras to include in usd'
   )
 
   parser.add_argument(

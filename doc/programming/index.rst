@@ -8,7 +8,7 @@ Introduction
 ~~~~~~~~~~~~
 
 This chapter is the MuJoCo programming guide. A separate chapter contains the :doc:`../APIreference/index`
-documentation. MuJoCo is a dynamic library compatible with Windows, Linux and macOS, which requires a process with AVX
+documentation. MuJoCo is a dynamic library compatible with Windows, Linux and macOS, which requires a processor with AVX
 instructions. The library exposes the full functionality of the simulator through a compiler-independent shared-memory C
 API. It can also be used in C++ programs.
 
@@ -76,24 +76,16 @@ directory; it contains error and warning messages, and can be deleted at any tim
 
 After verifying that the simulator works, you may also want to re-compile the code samples to ensure that you have a
 working development environment. We provide a cross-platform `CMake
-<https://github.com/google-deepmind/mujoco/blob/main/sample/CMakeLists.txt>`_ setup that can be used to build sample
+<https://github.com/google-deepmind/mujoco/blob/main/sample/CMakeLists.txt>`__ setup that can be used to build sample
 applications independently of the MuJoCo library itself.
 
 On macOS, the DMG disk image contains ``MuJoCo.app``, which you can double-click to launch the ``simulate`` GUI. You can
-also drag ``MuJoCo.app`` into the ``/Application`` on your system, as you would to install any other app. While
-``MuJoCo.app`` may look like a file, it is in fact an `Application Bundle <https://developer.apple.com/go/?id=bundle-
-structure>`_, which is a directory that contains executable binaries for all of MuJoCo's sample applications, along with
-an embedded `framework
-<https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPFrameworks/Concepts/WhatAreFrameworks.html>`_,
-which is a subdirectory containing the MuJoCo dynamic library and all of its public headers. In other words,
-``MuJoCo.app`` contains all the same files that are shipped in the archive on Windows and Linux. To see this, right
-click (or control-click) on ``MuJoCo.app`` and click "Show Package Contents".
-
-As mentioned above, ``mujoco.framework`` contains the library and headers that are necessary to build any application
-that depends on MuJoCo. If you are using Xcode, you can import it as a framework dependency on your project. (This also
+also drag ``MuJoCo.app`` into the ``/Application`` on your system, as you would to install any other app. As well as the
+``MuJoCo.app`` `Application Bundle <https://developer.apple.com/go/?id=bundle-
+structure>`__, the DMG includes the ``mujoco.framework`` subdirectory containing the MuJoCo dynamic library and all of
+its public headers. If you are using Xcode, you can import it as a framework dependency on your project. (This also
 works for Swift projects without any modification). If you are building manually, you can use ``-F`` and
-``-framework mujoco`` to specify the header search path and the library search path respectively. The macOS Makefile
-provides an example for this.
+``-framework mujoco`` to specify the header search path and the library search path respectively.
 
 .. _inBuild:
 
@@ -156,6 +148,10 @@ links below, to make this documentation self-contained.
    Defines MuJoCo's ``mjtNum`` floating-point type to be either ``double`` or ``float``. See :ref:`mjtNum`.
 `mjspec.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjspec.h>`__
    Defines enums and structs used for :doc:`procedural model editing <modeledit>`.
+`mjplugin.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjplugin.h>`__
+   Defines data structures required by :ref:`engine plugins<exPlugin>`.
+`mjthread.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjthread.h>`__
+   Defines data structures and functions required by :ref:`thread<Thread>`.
 `mjmacro.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjmacro.h>`__
    Defines C macros that are useful in user code.
 `mjxmacro.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjxmacro.h>`__
@@ -165,10 +161,8 @@ links below, to make this documentation self-contained.
 `mjexport.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjexport.h>`__
    Macros used for exporting public symbols from the MuJoCo library. This header should not be used directly by client
    code.
-`mjplugin.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjplugin.h>`__
-   Defines data structures required by :ref:`engine plugins<exPlugin>`.
-`mjthread.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjthread.h>`__
-   Defines data structures and functions required by :ref:`thread<Thread>`.
+`mjsan.h <https://github.com/google-deepmind/mujoco/blob/main/include/mujoco/mjsan.h>`__
+   Definitions required when building with sanitizer instrumentation.
 
 .. _inVersion:
 

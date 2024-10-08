@@ -14,8 +14,10 @@
 
 #include "user/user_api.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <new>
 #include <string>
@@ -88,49 +90,72 @@ mjModel* mj_compile(mjSpec* s, const mjVFS* vfs) {
 
 
 
-// recompile spec into existing model and data while preserving the state
-void mj_recompile(mjSpec* s, const mjVFS* vfs, mjModel* m, mjData* d) {
+// recompile spec to model, preserving the state, return 0 on success
+[[nodiscard]] int mj_recompile(mjSpec* s, const mjVFS* vfs, mjModel* m, mjData* d) {
   mjCModel* modelC = static_cast<mjCModel*>(s->element);
+  std::string state_name = "state";
+  mjtNum time = 0;
   if (d) {
-    modelC->SaveState(d->qpos, d->qvel, d->act);
+    time = d->time;
+    modelC->SaveState(state_name, d->qpos, d->qvel, d->act, d->ctrl, d->mocap_pos, d->mocap_quat);
   }
-  modelC->Compile(vfs, &m);
+  if (!modelC->Compile(vfs, &m)) {
+    if (d) {
+      mj_deleteData(d);
+    }
+    return -1;
+  };
   if (d) {
     modelC->MakeData(m, &d);
-    modelC->RestoreState(d->qpos, d->qvel, d->act);
+    modelC->RestoreState(state_name, m->qpos0, m->body_pos, m->body_quat, d->qpos, d->qvel,
+                         d->act, d->ctrl, d->mocap_pos, d->mocap_quat);
+    d->time = time;
   }
+  return 0;
 }
 
 
 
 // attach body to a frame of the parent
-int mjs_attachBody(mjsFrame* parent, const mjsBody* child,
-                   const char* prefix, const char* suffix) {
+mjsBody* mjs_attachBody(mjsFrame* parent, const mjsBody* child,
+                        const char* prefix, const char* suffix) {
+  if (!parent) {
+    mju_error("parent frame is null");
+    return nullptr;
+  }
   mjCFrame* frame_parent = static_cast<mjCFrame*>(parent->element);
   mjCBody* child_body = static_cast<mjCBody*>(child->element);
   try {
     *frame_parent += std::string(prefix) + *child_body + std::string(suffix);
   } catch (mjCError& e) {
     frame_parent->model->SetError(e);
-    return -1;
+    return nullptr;
   }
-  return 0;
+  mjsBody* attached_body = frame_parent->last_attached;
+  frame_parent->last_attached = nullptr;
+  return attached_body;
 }
 
 
 
 // attach frame to a parent body
-int mjs_attachFrame(mjsBody* parent, const mjsFrame* child,
-                    const char* prefix, const char* suffix) {
+mjsFrame* mjs_attachFrame(mjsBody* parent, const mjsFrame* child,
+                          const char* prefix, const char* suffix) {
+  if (!parent) {
+    mju_error("parent body is null");
+    return nullptr;
+  }
   mjCBody* body_parent = static_cast<mjCBody*>(parent->element);
   mjCFrame* child_frame = static_cast<mjCFrame*>(child->element);
   try {
     *body_parent += std::string(prefix) + *child_frame + std::string(suffix);
   } catch (mjCError& e) {
     body_parent->model->SetError(e);
-    return -1;
+    return nullptr;
   }
-  return 0;
+  mjsFrame* attached_frame = body_parent->last_attached;
+  body_parent->last_attached = nullptr;
+  return attached_frame;
 }
 
 
@@ -164,8 +189,10 @@ int mjs_isWarning(mjSpec* s) {
 
 // delete model
 void mj_deleteSpec(mjSpec* s) {
-  mjCModel* model = static_cast<mjCModel*>(s->element);
-  delete model;
+  if (s) {
+    mjCModel* model = static_cast<mjCModel*>(s->element);
+    delete model;
+  }
 }
 
 
@@ -174,6 +201,19 @@ void mj_deleteSpec(mjSpec* s) {
 void mjs_addSpec(mjSpec* s, mjSpec* child) {
   mjCModel* model = static_cast<mjCModel*>(s->element);
   model->AppendSpec(child);
+}
+
+
+
+// activate plugin
+void mjs_activatePlugin(mjSpec* s, const char* name) {
+  int plugin_slot = -1;
+  const mjpPlugin* plugin = mjp_getPlugin(name, &plugin_slot);
+  if (!plugin) {
+    mju_error("unknown plugin '%s'", name);
+  }
+  mjCModel* model = static_cast<mjCModel*>(s->element);
+  model->ActivatePlugin(plugin, plugin_slot);
 }
 
 
@@ -458,7 +498,7 @@ mjsKey* mjs_addKey(mjSpec* s) {
 mjsPlugin* mjs_addPlugin(mjSpec* s) {
   mjCModel* modelC = static_cast<mjCModel*>(s->element);
   mjCPlugin* plugin = modelC->AddPlugin();
-  plugin->spec.instance = static_cast<mjsElement*>(plugin);
+  plugin->spec.element = static_cast<mjsElement*>(plugin);
   return &plugin->spec;
 }
 
@@ -479,9 +519,16 @@ mjsDefault* mjs_addDefault(mjSpec* s, const char* classname, const mjsDefault* p
 
 
 
-// get objects
+// get spec from body
 mjSpec* mjs_getSpec(mjsBody* body) {
   return &(static_cast<mjCBody*>(body->element)->model->spec);
+}
+
+
+
+// get spec from frame
+mjSpec* mjs_getSpecFromFrame(mjsFrame* frame) {
+  return &(static_cast<mjCFrame*>(frame->element)->model->spec);
 }
 
 
@@ -529,14 +576,30 @@ mjsDefault* mjs_getSpecDefault(mjSpec* s) {
 
 // find body in model by name
 mjsBody* mjs_findBody(mjSpec* s, const char* name) {
-  mjCModel* model = static_cast<mjCModel*>(s->element);
-  mjCBase* body = 0;
-  if (model->IsCompiled()) {
-    body = model->FindObject(mjOBJ_BODY, std::string(name));  // fast lookup
-  } else {
-    body = model->FindBody(model->GetWorld(), std::string(name));  // recursive search
-  }
+  mjsElement* body = mjs_findElement(s, mjOBJ_BODY, name);
   return body ? &(static_cast<mjCBody*>(body)->spec) : nullptr;
+}
+
+
+
+// find element in spec by name
+mjsElement* mjs_findElement(mjSpec* s, mjtObj type, const char* name) {
+  mjCModel* model = static_cast<mjCModel*>(s->element);
+  if (model->IsCompiled()) {
+    return model->FindObject(type, std::string(name));  // fast lookup
+  }
+  switch (type) {
+    case mjOBJ_BODY:
+    case mjOBJ_SITE:
+    case mjOBJ_GEOM:
+    case mjOBJ_JOINT:
+    case mjOBJ_CAMERA:
+    case mjOBJ_LIGHT:
+    case mjOBJ_FRAME:
+      return model->FindTree(model->GetWorld(), type, std::string(name));  // recursive search
+    default:
+      return model->FindObject(type, std::string(name));  // always available
+  }
 }
 
 
@@ -550,29 +613,10 @@ mjsBody* mjs_findChild(mjsBody* bodyspec, const char* name) {
 
 
 
-// find mesh by name
-mjsMesh* mjs_findMesh(mjSpec* s, const char* name) {
-  mjCModel* model = static_cast<mjCModel*>(s->element);
-  mjCMesh* mesh = (mjCMesh*)model->FindObject(mjOBJ_MESH, std::string(name));
-  return mesh ? &(static_cast<mjCMesh*>(mesh)->spec) : nullptr;
-}
-
-
-
 // find frame by name
 mjsFrame* mjs_findFrame(mjSpec* s, const char* name) {
-  mjCModel* model = static_cast<mjCModel*>(s->element);
-  mjCFrame* frame = (mjCFrame*)model->FindFrame(model->GetWorld(), std::string(name));
+  mjsElement* frame = mjs_findElement(s, mjOBJ_FRAME, name);
   return frame ? &(static_cast<mjCFrame*>(frame)->spec) : nullptr;
-}
-
-
-
-// find keyframe by name
-mjsKey* mjs_findKeyframe(mjSpec* s, const char* name) {
-  mjCModel* model = static_cast<mjCModel*>(s->element);
-  mjCKey* key = (mjCKey*)model->FindObject(mjOBJ_KEY, std::string(name));
-  return key ? &(static_cast<mjCKey*>(key)->spec) : nullptr;
 }
 
 
@@ -599,6 +643,9 @@ const char* mjs_resolveOrientation(double quat[4], mjtByte degree, const char* s
 
 // get id
 int mjs_getId(mjsElement* element) {
+  if (!element) {
+    return -1;
+  }
   return static_cast<mjCBase*>(element)->id;
 }
 
@@ -613,17 +660,27 @@ void mjs_setDefault(mjsElement* element, mjsDefault* defspec) {
 
 
 // return first child of selected type
-mjsElement* mjs_firstChild(mjsBody* body, mjtObj type) {
+mjsElement* mjs_firstChild(mjsBody* body, mjtObj type, int recurse) {
   mjCBody* bodyC = static_cast<mjCBody*>(body->element);
-  return bodyC->NextChild(NULL, type);
+  try {
+    return bodyC->NextChild(NULL, type, recurse);
+  } catch (mjCError& e) {
+    bodyC->model->SetError(e);
+    return nullptr;
+  }
 }
 
 
 
 // return body's next child; return NULL if child is last
-mjsElement* mjs_nextChild(mjsBody* body, mjsElement* child) {
+mjsElement* mjs_nextChild(mjsBody* body, mjsElement* child, int recurse) {
   mjCBody* bodyC = static_cast<mjCBody*>(body->element);
-  return bodyC->NextChild(child);
+  try {
+    return bodyC->NextChild(child, child->elemtype, recurse);
+  } catch(mjCError& e) {
+    bodyC->model->SetError(e);
+    return nullptr;
+  }
 }
 
 
@@ -874,6 +931,26 @@ mjsMaterial* mjs_asMaterial(mjsElement* element) {
 
 
 
+// return plugin given mjsElement
+mjsPlugin* mjs_asPlugin(mjsElement* element) {
+  if (element && element->elemtype == mjOBJ_PLUGIN) {
+    return &(static_cast<mjCPlugin*>(element)->spec);
+  }
+  return nullptr;
+}
+
+
+
+// copy buffer to destination buffer
+void mjs_setBuffer(mjByteVec* dest, const void* array, int size) {
+  const std::byte* buffer = static_cast<const std::byte*>(array);
+  dest->clear();
+  dest->reserve(size);
+  std::copy_n(buffer, size, std::back_inserter(*dest));
+}
+
+
+
 // set string
 void mjs_setString(mjString* dest, const char* text) {
   std::string* str = static_cast<std::string*>(dest);
@@ -972,20 +1049,10 @@ const double* mjs_getDouble(const mjDoubleVec* source, int* size) {
 
 // set plugin attributes
 void mjs_setPluginAttributes(mjsPlugin* plugin, void* attributes) {
-  mjCPlugin* pluginC = static_cast<mjCPlugin*>(plugin->instance);
+  mjCPlugin* pluginC = static_cast<mjCPlugin*>(plugin->element);
   std::map<std::string, std::string, std::less<>>* config_attribs =
       reinterpret_cast<std::map<std::string, std::string, std::less<>>*>(attributes);
   pluginC->config_attribs = std::move(*config_attribs);
-}
-
-
-
-// Set active plugins.
-void mjs_setActivePlugins(mjSpec* s, void* activeplugins) {
-  mjCModel* modelC = static_cast<mjCModel*>(s->element);
-  std::vector<std::pair<const mjpPlugin*, int>>* active_plugins =
-      reinterpret_cast<std::vector<std::pair<const mjpPlugin*, int>>*>(activeplugins);
-  modelC->SetActivePlugins(std::move(*active_plugins));
 }
 
 
