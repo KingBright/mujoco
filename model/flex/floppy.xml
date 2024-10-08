@@ -16,13 +16,9 @@
 <mujoco model="Floppy">
   <include file="scene.xml"/>
 
-  <extension>
-    <plugin plugin="mujoco.elasticity.solid"/>
-  </extension>
-
   <compiler autolimits="true"/>
 
-  <option solver="Newton" tolerance="1e-6" timestep=".001"/>
+  <option solver="CG" tolerance="1e-6" timestep=".001"/>
 
   <size memory="100M"/>
 
@@ -31,17 +27,11 @@
   </visual>
 
   <worldbody>
-    <composite type="particle" count="24 4 4" spacing="0.1" offset=".1 0 1.5">
-      <geom size=".025" rgba=".8 .2 .1 1" group="4"
-            condim="3" solref="0.01 1" solimp=".95 .99 .0001"/>
-      <skin inflate="0" rgba="0 .7 .7 .6"/>
-      <plugin plugin="mujoco.elasticity.solid">
-        <config key="poisson" value="0.2"/>
-        <config key="damping" value="0.002"/>
-        <!--Units are in Pa (SI)-->
-        <config key="young" value="5e4"/>
-      </plugin>
-    </composite>
+    <flexcomp type="grid" count="24 4 4" spacing=".1 .1 .1" pos=".1 0 1.5"
+              radius=".0" rgba="0 .7 .7 1" name="softbody" dim="3" mass="25">
+      <contact condim="3" solref="0.01 1" solimp=".95 .99 .0001" selfcollide="none"/>
+      <elasticity young="5e4" damping="0.002" poisson="0.2"/>
+    </flexcomp>
 
     <body>
       <joint name="hinge" pos="0 0 .5" axis="0 1 0" damping="50"/>

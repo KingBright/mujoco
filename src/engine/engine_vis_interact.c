@@ -14,12 +14,12 @@
 
 #include "engine/engine_vis_interact.h"
 
-#include <math.h>
 #include <stddef.h>
 
 #include <mujoco/mjdata.h>
 #include <mujoco/mjexport.h>
 #include <mujoco/mjmodel.h>
+#include <mujoco/mjsan.h>  // IWYU pragma: keep
 #include <mujoco/mjvisualize.h>
 #include "engine/engine_core_smooth.h"
 #include "engine/engine_io.h"
@@ -689,7 +689,7 @@ void mjv_applyPerturbForce(const mjModel* m, mjData* d, const mjvPerturb* pert) 
     mju_addTo3(svel, body_linvel);
 
     // add critical damping force of selection point
-    mju_addToScl3(force, svel, -sqrtf(stiffness)*pert->localmass);
+    mju_addToScl3(force, svel, -mju_sqrt(stiffness)*pert->localmass);
 
     // torque on body com due to force
     mju_cross(torque, moment_arm, force);
@@ -697,7 +697,7 @@ void mjv_applyPerturbForce(const mjModel* m, mjData* d, const mjvPerturb* pert) 
     // add critically damped torsional torque along displacement axis
     stiffness = m->vis.map.stiffnessrot;
     mju_normalize3(diff);
-    mju_addToScl3(torque, diff, -sqrtf(stiffness)*inertia*mju_dot3(diff, body_rotvel));
+    mju_addToScl3(torque, diff, -mju_sqrt(stiffness)*inertia*mju_dot3(diff, body_rotvel));
   }
 
   if (((pert->active | pert->active2) & mjPERT_ROTATE)) {
@@ -708,7 +708,7 @@ void mjv_applyPerturbForce(const mjModel* m, mjData* d, const mjvPerturb* pert) 
     mju_negQuat(xiquat, xiquat);
     mju_mulQuat(difquat, pert->refquat, xiquat);
     mju_quat2Vel(torque, difquat, 1.0/(stiffness*inertia));
-    mju_addToScl3(torque, body_rotvel, -sqrtf(stiffness)*inertia);
+    mju_addToScl3(torque, body_rotvel, -mju_sqrt(stiffness)*inertia);
   }
 }
 

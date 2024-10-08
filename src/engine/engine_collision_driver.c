@@ -14,13 +14,13 @@
 
 #include "engine/engine_collision_driver.h"
 
-#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
 #include <mujoco/mjdata.h>
 #include <mujoco/mjmacro.h>
 #include <mujoco/mjmodel.h>
+#include <mujoco/mjsan.h>  // IWYU pragma: keep
 #include "engine/engine_callback.h"
 #include "engine/engine_collision_convex.h"
 #include "engine/engine_collision_primitive.h"
@@ -602,22 +602,22 @@ int mj_collideOBB(const mjtNum aabb1[6], const mjtNum aabb2[6],
       for (int i=0; i < 2; i++) {  // bounding boxes
         if (product == NULL) {
           proj[i] = mju_dot3(xcenter[i], normal[j][k]);
-          radius[i] = fabs(aabb[i][3]*mju_dot3(normal[i][0], normal[j][k])) +
-                      fabs(aabb[i][4]*mju_dot3(normal[i][1], normal[j][k])) +
-                      fabs(aabb[i][5]*mju_dot3(normal[i][2], normal[j][k]));
+          radius[i] = mju_abs(aabb[i][3]*mju_dot3(normal[i][0], normal[j][k])) +
+                      mju_abs(aabb[i][4]*mju_dot3(normal[i][1], normal[j][k])) +
+                      mju_abs(aabb[i][5]*mju_dot3(normal[i][2], normal[j][k]));
         } else {
           int adr = 18*i + 9*j + 3*k;
           proj[i] = aabb[i][0] * product[adr + 0] +
                     aabb[i][1] * product[adr + 1] +
                     aabb[i][2] * product[adr + 2] +
                     offset[6*i + 3*j + k];
-          radius[i] = fabs(aabb[i][3]*product[adr + 0]) +
-                      fabs(aabb[i][4]*product[adr + 1]) +
-                      fabs(aabb[i][5]*product[adr + 2]);
+          radius[i] = mju_abs(aabb[i][3]*product[adr + 0]) +
+                      mju_abs(aabb[i][4]*product[adr + 1]) +
+                      mju_abs(aabb[i][5]*product[adr + 2]);
         }
       }
 
-      if (radius[0]+radius[1]+margin < fabs(proj[1]-proj[0])) {
+      if (radius[0]+radius[1]+margin < mju_abs(proj[1]-proj[0])) {
         return 0;
       }
     }

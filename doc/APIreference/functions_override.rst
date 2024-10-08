@@ -20,7 +20,7 @@ Initialize an empty VFS, :ref:`mj_deleteVFS` must be called to deallocate the VF
 
 .. _mj_addFileVFS:
 
-Add file to VFS. The directory argument is optional and can be NULL or empty. Returns 0 on success, 1 when VFS is full,
+Add file to VFS. The directory argument is optional and can be NULL or empty. Returns 0 on success,
 2 on name collision, or -1 when an internal error occurs.
 
 .. _Parseandcompile:
@@ -28,6 +28,12 @@ Add file to VFS. The directory argument is optional and can be NULL or empty. Re
 The key function here is :ref:`mj_loadXML`. It invokes the built-in parser and compiler, and either returns a pointer to
 a valid mjModel, or NULL - in which case the user should check the error information in the user-provided string.
 The model and all files referenced in it can be loaded from disk or from a VFS when provided.
+
+.. _mj_compile:
+
+Compile :ref:`mjSpec` to :ref:`mjModel`. A spec can be edited and compiled multiple times, returning a new
+:ref:`mjModel` instance that takes the edits into account.
+If compilation fails, :ref:`mj_compile` returns ``NULL``; the error can be read with :ref:`mjs_getError`.
 
 .. _mj_recompile:
 
@@ -38,10 +44,16 @@ reallocate existing :ref:`mjModel` and :ref:`mjData` instances in-place. Second,
 newly added or removed degrees of freedom. This allows the user to continue simulation with the same model and data
 struct pointers while editing the model programmatically.
 
-.. admonition:: Incomplete implementation
-   :class: attention
+:ref:`mj_recompile` returns 0 if compilation succeed. In the case of failure, the given :ref:`mjModel` and :ref:`mjData`
+instances will be deleted; as in :ref:`mj_compile`, the compilation error can be read with :ref:`mjs_getError`.
 
-   This function is currently incomplete, preserving only ``mjData.qpos`` and ``mjData.qvel``.
+.. _mj_saveXMLString:
+
+Save spec to XML string, return 1 on success, 0 otherwise. XML saving requires that the spec first be compiled.
+
+.. _mj_saveXML:
+
+Save spec to XML file, return 1 on success, 0 otherwise. XML saving requires that the spec first be compiled.
 
 .. _Mainsimulation:
 
@@ -179,13 +191,22 @@ degrees-of-freedom and a given point. Given a body specified by its integer id (
 frame (``point``) treated as attached to the body, the Jacobian has both translational (``jacp``) and rotational
 (``jacr``) components. Passing ``NULL`` for either pointer will skip that part of the computation. Each component is a
 3-by-nv matrix. Each row of this matrix is the gradient of the corresponding coordinate of the specified point with
-respect to the degrees-of-freedom. The :ref:`pipeline stages<piStages>` required for Jacobian computations to be
-consistent with the current generalized positions ``mjData.qpos`` are :ref:`mj_kinematics` and :ref:`mj_comPos`.
+respect to the degrees-of-freedom. The frame with respect to which the Jacobian is computed is centered at the body
+center-of-mass but aligned with the world frame. The minimal :ref:`pipeline stages<piForward>` required for Jacobian
+computations to be consistent with the current generalized positions ``mjData.qpos`` are :ref:`mj_kinematics` followed
+by :ref:`mj_comPos`.
 
 .. _mj_jacBody:
 
 This and the remaining variants of the Jacobian function call mj_jac internally, with the center of the body, geom or
 site. They are just shortcuts; the same can be achieved by calling mj_jac directly.
+
+.. _mj_jacDot:
+
+This function computes the time-derivative of an end-effector kinematic Jacobian computed by :ref:`mj_jac`.
+The minimal :ref:`pipeline stages<piStages>` required for computation to be
+consistent with the current generalized positions and velocities ``mjData.{qpos, qvel}`` are
+:ref:`mj_kinematics`, :ref:`mj_comPos`, :ref:`mj_comVel` (in that order).
 
 .. _mj_angmomMat:
 
@@ -567,7 +588,7 @@ outputs of derivative functions are the trailing rather than leading arguments.
 
 .. _mjd_transitionFD:
 
-Finite-differenced discrete-time transition matrices.
+Compute finite-differenced discrete-time transition matrices.
 
 Letting :math:`x, u` denote the current :ref:`state<gePhysicsState>` and :ref:`control<geInput>`
 vector in an mjData instance, and letting :math:`y, s` denote the next state and sensor
@@ -588,12 +609,27 @@ These matrices and their dimensions are:
 - All outputs are optional (can be NULL).
 - ``eps`` is the finite-differencing epsilon.
 - ``flg_centered`` denotes whether to use forward (0) or centered (1) differences.
-- Accuracy can be somewhat improved if solver :ref:`iterations<option-iterations>` are set to a
-  fixed (small) value and solver :ref:`tolerance<option-tolerance>` is set to 0. This insures that
-  all calls to the solver will perform exactly the same number of iterations.
+- The Runge-Kutta integrator (:ref:`mjINT_RK4<mjtIntegrator>`) is not supported.
 
-.. attention::
-   - The Runge-Kutta 4th-order integrator (``mjINT_RK4``) is not supported.
+.. admonition:: Improving speed and accuracy
+   :class: tip
+
+   warmstart
+     If warm-starts are not :ref:`disabled<option-flag-warmstart>`, the warm-start accelerations
+     ``mjData.qacc_warmstart`` which are present at call-time are loaded at the start of every relevant pipeline call,
+     to preserve determinism. If solver computations are an expensive part of the simulation, the following trick can
+     lead to significant speed-ups: First call :ref:`mj_forward` to let the solver converge, then reduce :ref:`solver
+     iterations<option-iterations>` significantly, then call :ref:`mjd_transitionFD`, finally, restore the original
+     value of :ref:`iterations<option-iterations>`. Because we are already near the solution, few iteration are required
+     to find the new minimum. This is especially true for the :ref:`Newton<option-solver>` solver, where the required
+     number of iteration for convergence near the minimum can be as low as 1.
+
+   tolerance
+      Accuracy can be improved if solver :ref:`tolerance<option-tolerance>` is set to 0. This means that all calls to
+      the solver will perform exactly the same number of iterations, preventing numerical errors due to early
+      termination. Of course, this means that :ref:`solver iterations<option-iterations>` should be small, to not tread
+      water at the minimum. This method and the one described above can and should be combined.
+
 
 .. _mjd_inverseFD:
 

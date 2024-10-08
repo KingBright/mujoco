@@ -128,6 +128,14 @@ class MuJoCoBindingsTest(parameterized.TestCase):
     self.assertEqual(
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'ball'), 2)
 
+  def test_load_xml_repeated_asset_name(self):
+    # Assets aren't allowed to have the same filename (even if they have
+    # different paths).
+    with self.assertRaisesRegex(ValueError, r'Repeated.*'):
+      mujoco.MjModel.from_xml_string(
+          '<mujoco/>', {'asset.xml': b'asset1', 'path/asset.xml': b'asset2'}
+      )
+
   def test_can_read_array(self):
     np.testing.assert_array_equal(
         self.model.body_pos,
@@ -766,7 +774,6 @@ class MuJoCoBindingsTest(parameterized.TestCase):
     np.testing.assert_array_equal(qvel, self.data.qvel)
     np.testing.assert_array_equal(act, self.data.act)
 
-
   def test_mj_angmomMat(self):  # pylint: disable=invalid-name
     self.data.qvel = np.ones(self.model.nv, np.float64)
     mujoco.mj_forward(self.model, self.data)
@@ -870,7 +877,7 @@ Euler integrator, semi-implicit in velocity.
     self.assertEqual(mujoco.mjtEnableBit.mjENBL_OVERRIDE, 1<<0)
     self.assertEqual(mujoco.mjtEnableBit.mjENBL_ENERGY, 1<<1)
     self.assertEqual(mujoco.mjtEnableBit.mjENBL_FWDINV, 1<<2)
-    self.assertEqual(mujoco.mjtEnableBit.mjNENABLE, 6)
+    self.assertEqual(mujoco.mjtEnableBit.mjNENABLE, 7)
     self.assertEqual(mujoco.mjtGeom.mjGEOM_PLANE, 0)
     self.assertEqual(mujoco.mjtGeom.mjGEOM_HFIELD, 1)
     self.assertEqual(mujoco.mjtGeom.mjGEOM_SPHERE, 2)

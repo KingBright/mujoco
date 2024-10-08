@@ -14,11 +14,11 @@
 
 #include "engine/engine_collision_sdf.h"
 
-#include <math.h>
 #include <stdio.h>
 
 #include <mujoco/mjdata.h>
 #include <mujoco/mjmodel.h>
+#include <mujoco/mjsan.h>  // IWYU pragma: keep
 #include <mujoco/mjtnum.h>
 #include "engine/engine_collision_primitive.h"
 #include "engine/engine_io.h"

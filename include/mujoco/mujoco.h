@@ -29,6 +29,7 @@
 #include <mujoco/mjmacro.h>
 #include <mujoco/mjplugin.h>
 #include <mujoco/mjrender.h>
+#include <mujoco/mjsan.h>
 #include <mujoco/mjspec.h>
 #include <mujoco/mjthread.h>
 #include <mujoco/mjtnum.h>
@@ -77,10 +78,10 @@ MJAPI extern const char* mjRNDSTRING[mjNRNDFLAG][3];
 // Initialize an empty VFS, mj_deleteVFS must be called to deallocate the VFS.
 MJAPI void mj_defaultVFS(mjVFS* vfs);
 
-// Add file to VFS, return 0: success, 1: full, 2: repeated name, -1: failed to load.
+// Add file to VFS, return 0: success, 2: repeated name, -1: failed to load.
 MJAPI int mj_addFileVFS(mjVFS* vfs, const char* directory, const char* filename);
 
-// Add file to VFS from buffer, return 0: success, 1: full, 2: repeated name, -1: failed to load.
+// Add file to VFS from buffer, return 0: success, 2: repeated name, -1: failed to load.
 MJAPI int mj_addBufferVFS(mjVFS* vfs, const char* name, const void* buffer, int nbuffer);
 
 // Delete file from VFS, return 0: success, -1: not found in VFS.
@@ -106,8 +107,8 @@ MJAPI mjSpec* mj_parseXMLString(const char* xml, const mjVFS* vfs, char* error, 
 // Compile spec to model.
 MJAPI mjModel* mj_compile(mjSpec* s, const mjVFS* vfs);
 
-// Recompile spec to model, preserving the state.
-MJAPI void mj_recompile(mjSpec* s, const mjVFS* vfs, mjModel* m, mjData* d);
+// Recompile spec to model, preserving the state, return 0 on success.
+MJAPI int mj_recompile(mjSpec* s, const mjVFS* vfs, mjModel* m, mjData* d);
 
 // Update XML data structures with info from low-level model, save as MJCF.
 // If error is not NULL, it must have size error_sz.
@@ -197,7 +198,7 @@ MJAPI void mj_resetDataDebug(const mjModel* m, mjData* d, unsigned char debug_va
 // Reset data. If 0 <= key < nkey, set fields from specified keyframe.
 MJAPI void mj_resetDataKeyframe(const mjModel* m, mjData* d, int key);
 
-#ifndef ADDRESS_SANITIZER
+#ifndef ADDRESS_SANITIZER  // Stack management functions declared in mjsan.h if ASAN is active.
 
 // Mark a new frame on the mjData stack.
 MJAPI void mj_markStack(mjData* d);
@@ -239,6 +240,9 @@ MJAPI mjSpec* mj_copySpec(const mjSpec* s);
 
 // Free memory allocation in mjSpec.
 MJAPI void mj_deleteSpec(mjSpec* s);
+
+// Activate plugin.
+MJAPI void mjs_activatePlugin(mjSpec* s, const char* name);
 
 
 //---------------------------------- Printing ------------------------------------------------------
@@ -456,6 +460,10 @@ MJAPI void mj_jacSite(const mjModel* m, const mjData* d, mjtNum* jacp, mjtNum* j
 MJAPI void mj_jacPointAxis(const mjModel* m, mjData* d, mjtNum* jacPoint, mjtNum* jacAxis,
                            const mjtNum point[3], const mjtNum axis[3], int body);
 
+// Compute 3/6-by-nv Jacobian time derivative of global point attached to given body.
+MJAPI void mj_jacDot(const mjModel* m, const mjData* d, mjtNum* jacp, mjtNum* jacr,
+                     const mjtNum point[3], int body);
+
 // Compute subtree angular momentum matrix.
 MJAPI void mj_angmomMat(const mjModel* m, mjData* d, mjtNum* mat, int body);
 
@@ -507,7 +515,7 @@ MJAPI void mj_integratePos(const mjModel* m, mjtNum* qpos, const mjtNum* qvel, m
 // Normalize all quaternions in qpos-type vector.
 MJAPI void mj_normalizeQuat(const mjModel* m, mjtNum* qpos);
 
-// Map from body local to global Cartesian coordinates.
+// Map from body local to global Cartesian coordinates, sameframe takes values from mjtSameFrame.
 MJAPI void mj_local2Global(mjData* d, mjtNum xpos[3], mjtNum xmat[9], const mjtNum pos[3],
                            const mjtNum quat[4], int body, mjtByte sameframe);
 
@@ -1399,13 +1407,13 @@ MJAPI void mju_taskJoin(mjTask* task);
 
 //---------------------------------- Attachment ----------------------------------------------------
 
-// Attach child body to a parent frame, return 0 on success.
-MJAPI int mjs_attachBody(mjsFrame* parent, const mjsBody* child,
-                         const char* prefix, const char* suffix);
+// Attach child body to a parent frame, return the attached body if success or NULL otherwise.
+MJAPI mjsBody* mjs_attachBody(mjsFrame* parent, const mjsBody* child,
+                              const char* prefix, const char* suffix);
 
-// Attach child frame to a parent body, return 0 on success.
-MJAPI int mjs_attachFrame(mjsBody* parent, const mjsFrame* child,
-                          const char* prefix, const char* suffix);
+// Attach child frame to a parent body, return the attached frame if success or NULL otherwise.
+MJAPI mjsFrame* mjs_attachFrame(mjsBody* parent, const mjsFrame* child,
+                                const char* prefix, const char* suffix);
 
 // Detach body from mjSpec, remove all references and delete the body, return 0 on success.
 MJAPI int mjs_detachBody(mjSpec* s, mjsBody* b);
@@ -1518,20 +1526,20 @@ MJAPI mjsMaterial* mjs_addMaterial(mjSpec* s, mjsDefault* def);
 // Get spec from body.
 MJAPI mjSpec* mjs_getSpec(mjsBody* body);
 
-// Find body in model by name.
+// Get spec from frame.
+MJAPI mjSpec* mjs_getSpecFromFrame(mjsFrame* frame);
+
+// Find body in spec by name.
 MJAPI mjsBody* mjs_findBody(mjSpec* s, const char* name);
+
+// Find element in spec by name.
+MJAPI mjsElement* mjs_findElement(mjSpec* s, mjtObj type, const char* name);
 
 // Find child body by name.
 MJAPI mjsBody* mjs_findChild(mjsBody* body, const char* name);
 
-// Find mesh by name.
-MJAPI mjsMesh* mjs_findMesh(mjSpec* s, const char* name);
-
 // Find frame by name.
 MJAPI mjsFrame* mjs_findFrame(mjSpec* s, const char* name);
-
-// Find keyframe by name.
-MJAPI mjsKey* mjs_findKeyframe(mjSpec* s, const char* name);
 
 // Get default corresponding to an element.
 MJAPI mjsDefault* mjs_getDefault(mjsElement* element);
@@ -1545,11 +1553,12 @@ MJAPI mjsDefault* mjs_getSpecDefault(mjSpec* s);
 // Get element id.
 MJAPI int mjs_getId(mjsElement* element);
 
-// Return body's first child of given type.
-MJAPI mjsElement* mjs_firstChild(mjsBody* body, mjtObj type);
+// Return body's first child of given type. If recurse is nonzero, also search the body's subtree.
+MJAPI mjsElement* mjs_firstChild(mjsBody* body, mjtObj type, int recurse);
 
 // Return body's next child of the same type; return NULL if child is last.
-MJAPI mjsElement* mjs_nextChild(mjsBody* body, mjsElement* child);
+// If recurse is nonzero, also search the body's subtree.
+MJAPI mjsElement* mjs_nextChild(mjsBody* body, mjsElement* child, int recurse);
 
 // Return spec's first element of selected type.
 MJAPI mjsElement* mjs_firstElement(mjSpec* s, mjtObj type);
@@ -1557,77 +1566,11 @@ MJAPI mjsElement* mjs_firstElement(mjSpec* s, mjtObj type);
 // Return spec's next element; return NULL if element is last.
 MJAPI mjsElement* mjs_nextElement(mjSpec* s, mjsElement* element);
 
-// Safely cast an element as mjsBody, or return NULL if the element is not an mjsBody.
-MJAPI mjsBody* mjs_asBody(mjsElement* element);
-
-// Safely cast an element as mjsGeom, or return NULL if the element is not an mjsGeom.
-MJAPI mjsGeom* mjs_asGeom(mjsElement* element);
-
-// Safely cast an element as mjsJoint, or return NULL if the element is not an mjsJoint.
-MJAPI mjsJoint* mjs_asJoint(mjsElement* element);
-
-// Safely cast an element as mjsSite, or return NULL if the element is not an mjsSite.
-MJAPI mjsSite* mjs_asSite(mjsElement* element);
-
-// Safely cast an element as mjsCamera, or return NULL if the element is not an mjsCamera.
-MJAPI mjsCamera* mjs_asCamera(mjsElement* element);
-
-// Safely cast an element as mjsLight, or return NULL if the element is not an mjsLight.
-MJAPI mjsLight* mjs_asLight(mjsElement* element);
-
-// Safely cast an element as mjsFrame, or return NULL if the element is not an mjsFrame.
-MJAPI mjsFrame* mjs_asFrame(mjsElement* element);
-
-// Safely cast an element as mjsActuator, or return NULL if the element is not an mjsActuator.
-MJAPI mjsActuator* mjs_asActuator(mjsElement* element);
-
-// Safely cast an element as mjsSensor, or return NULL if the element is not an mjsSensor.
-MJAPI mjsSensor* mjs_asSensor(mjsElement* element);
-
-// Safely cast an element as mjsFlex, or return NULL if the element is not an mjsFlex.
-MJAPI mjsFlex* mjs_asFlex(mjsElement* element);
-
-// Safely cast an element as mjsPair, or return NULL if the element is not an mjsPair.
-MJAPI mjsPair* mjs_asPair(mjsElement* element);
-
-// Safely cast an element as mjsEquality, or return NULL if the element is not an mjsEquality.
-MJAPI mjsEquality* mjs_asEquality(mjsElement* element);
-
-// Safely cast an element as mjsExclude, or return NULL if the element is not an mjsExclude.
-MJAPI mjsExclude* mjs_asExclude(mjsElement* element);
-
-// Safely cast an element as mjsTendon, or return NULL if the element is not an mjsTendon.
-MJAPI mjsTendon* mjs_asTendon(mjsElement* element);
-
-// Safely cast an element as mjsNumeric, or return NULL if the element is not an mjsNumeric.
-MJAPI mjsNumeric* mjs_asNumeric(mjsElement* element);
-
-// Safely cast an element as mjsText, or return NULL if the element is not an mjsText.
-MJAPI mjsText* mjs_asText(mjsElement* element);
-
-// Safely cast an element as mjsTuple, or return NULL if the element is not an mjsTuple.
-MJAPI mjsTuple* mjs_asTuple(mjsElement* element);
-
-// Safely cast an element as mjsKey, or return NULL if the element is not an mjsKey.
-MJAPI mjsKey* mjs_asKey(mjsElement* element);
-
-// Safely cast an element as mjsMesh, or return NULL if the element is not an mjsMesh.
-MJAPI mjsMesh* mjs_asMesh(mjsElement* element);
-
-// Safely cast an element as mjsHField, or return NULL if the element is not an mjsHField.
-MJAPI mjsHField* mjs_asHField(mjsElement* element);
-
-// Safely cast an element as mjsSkin, or return NULL if the element is not an mjsSkin.
-MJAPI mjsSkin* mjs_asSkin(mjsElement* element);
-
-// Safely cast an element as mjsTexture, or return NULL if the element is not an mjsTexture.
-MJAPI mjsTexture* mjs_asTexture(mjsElement* element);
-
-// Safely cast an element as mjsMaterial, or return NULL if the element is not an mjsMaterial.
-MJAPI mjsMaterial* mjs_asMaterial(mjsElement* element);
-
 
 //---------------------------------- Attribute setters ---------------------------------------------
+
+// Copy buffer.
+MJAPI void mjs_setBuffer(mjByteVec* dest, const void* array, int size);
 
 // Copy text to string.
 MJAPI void mjs_setString(mjString* dest, const char* text);
@@ -1670,9 +1613,6 @@ MJAPI const double* mjs_getDouble(const mjDoubleVec* source, int* size);
 
 
 //---------------------------------- Spec utilities ------------------------------------------------
-
-// Set active plugins.
-MJAPI void mjs_setActivePlugins(mjSpec* s, void* activeplugins);
 
 // Set element's default.
 MJAPI void mjs_setDefault(mjsElement* element, mjsDefault* def);
@@ -1763,33 +1703,79 @@ MJAPI void mjs_defaultKey(mjsKey* key);
 MJAPI void mjs_defaultPlugin(mjsPlugin* plugin);
 
 
-//---------------------------------- Sanitizer instrumentation -------------------------------------
+//---------------------------------- Element casting -----------------------------------------------
 
-// Most users can ignore these functions, the following comments are primarily for developers.
-//
-// When built and run under address sanitizer (asan), mj_markStack and mj_freeStack are instrumented
-// to detect leakage of mjData stack frames. When the compiler inlines several callees that call
-// into mark/free into the same function, this instrumentation requires that the compiler retains
-// separate mark/free calls for each original callee. The memory-clobbered asm blocks act as a
-// barrier to prevent mark/free calls from being combined under optimization.
+// Safely cast an element as mjsBody, or return NULL if the element is not an mjsBody.
+MJAPI mjsBody* mjs_asBody(mjsElement* element);
 
-#ifdef ADDRESS_SANITIZER
+// Safely cast an element as mjsGeom, or return NULL if the element is not an mjsGeom.
+MJAPI mjsGeom* mjs_asGeom(mjsElement* element);
 
-void mj__markStack(mjData*) __attribute__((noinline));
-static inline void mj_markStack(mjData* d) __attribute__((always_inline)) {
-  asm volatile("" ::: "memory");
-  mj__markStack(d);
-  asm volatile("" ::: "memory");
-}
+// Safely cast an element as mjsJoint, or return NULL if the element is not an mjsJoint.
+MJAPI mjsJoint* mjs_asJoint(mjsElement* element);
 
-void mj__freeStack(mjData*) __attribute__((noinline));
-static inline void mj_freeStack(mjData* d) __attribute__((always_inline)) {
-  asm volatile("" ::: "memory");
-  mj__freeStack(d);
-  asm volatile("" ::: "memory");
-}
+// Safely cast an element as mjsSite, or return NULL if the element is not an mjsSite.
+MJAPI mjsSite* mjs_asSite(mjsElement* element);
 
-#endif  // ADDRESS_SANITIZER
+// Safely cast an element as mjsCamera, or return NULL if the element is not an mjsCamera.
+MJAPI mjsCamera* mjs_asCamera(mjsElement* element);
+
+// Safely cast an element as mjsLight, or return NULL if the element is not an mjsLight.
+MJAPI mjsLight* mjs_asLight(mjsElement* element);
+
+// Safely cast an element as mjsFrame, or return NULL if the element is not an mjsFrame.
+MJAPI mjsFrame* mjs_asFrame(mjsElement* element);
+
+// Safely cast an element as mjsActuator, or return NULL if the element is not an mjsActuator.
+MJAPI mjsActuator* mjs_asActuator(mjsElement* element);
+
+// Safely cast an element as mjsSensor, or return NULL if the element is not an mjsSensor.
+MJAPI mjsSensor* mjs_asSensor(mjsElement* element);
+
+// Safely cast an element as mjsFlex, or return NULL if the element is not an mjsFlex.
+MJAPI mjsFlex* mjs_asFlex(mjsElement* element);
+
+// Safely cast an element as mjsPair, or return NULL if the element is not an mjsPair.
+MJAPI mjsPair* mjs_asPair(mjsElement* element);
+
+// Safely cast an element as mjsEquality, or return NULL if the element is not an mjsEquality.
+MJAPI mjsEquality* mjs_asEquality(mjsElement* element);
+
+// Safely cast an element as mjsExclude, or return NULL if the element is not an mjsExclude.
+MJAPI mjsExclude* mjs_asExclude(mjsElement* element);
+
+// Safely cast an element as mjsTendon, or return NULL if the element is not an mjsTendon.
+MJAPI mjsTendon* mjs_asTendon(mjsElement* element);
+
+// Safely cast an element as mjsNumeric, or return NULL if the element is not an mjsNumeric.
+MJAPI mjsNumeric* mjs_asNumeric(mjsElement* element);
+
+// Safely cast an element as mjsText, or return NULL if the element is not an mjsText.
+MJAPI mjsText* mjs_asText(mjsElement* element);
+
+// Safely cast an element as mjsTuple, or return NULL if the element is not an mjsTuple.
+MJAPI mjsTuple* mjs_asTuple(mjsElement* element);
+
+// Safely cast an element as mjsKey, or return NULL if the element is not an mjsKey.
+MJAPI mjsKey* mjs_asKey(mjsElement* element);
+
+// Safely cast an element as mjsMesh, or return NULL if the element is not an mjsMesh.
+MJAPI mjsMesh* mjs_asMesh(mjsElement* element);
+
+// Safely cast an element as mjsHField, or return NULL if the element is not an mjsHField.
+MJAPI mjsHField* mjs_asHField(mjsElement* element);
+
+// Safely cast an element as mjsSkin, or return NULL if the element is not an mjsSkin.
+MJAPI mjsSkin* mjs_asSkin(mjsElement* element);
+
+// Safely cast an element as mjsTexture, or return NULL if the element is not an mjsTexture.
+MJAPI mjsTexture* mjs_asTexture(mjsElement* element);
+
+// Safely cast an element as mjsMaterial, or return NULL if the element is not an mjsMaterial.
+MJAPI mjsMaterial* mjs_asMaterial(mjsElement* element);
+
+// Safely cast an element as mjsPlugin, or return NULL if the element is not an mjsPlugin.
+MJAPI mjsPlugin* mjs_asPlugin(mjsElement* element);
 
 #ifdef __cplusplus
 }

@@ -56,6 +56,7 @@ public const bool THIRD_PARTY_MUJOCO_MJRENDER_H_ = true;
 public const int mjNAUX = 10;
 public const int mjMAXTEXTURE = 1000;
 public const int mjMAXMATERIAL = 1000;
+public const bool THIRD_PARTY_MUJOCO_INCLUDE_MJSAN_H_ = true;
 public const bool THIRD_PARTY_MUJOCO_INCLUDE_MJSPEC_H_ = true;
 public const bool THIRD_PARTY_MUJOCO_INCLUDE_MJTHREAD_H_ = true;
 public const int mjMAXTHREAD = 128;
@@ -167,7 +168,8 @@ public enum mjtEnableBit : int{
   mjENBL_INVDISCRETE = 8,
   mjENBL_MULTICCD = 16,
   mjENBL_ISLAND = 32,
-  mjNENABLE = 6,
+  mjENBL_NATIVECCD = 64,
+  mjNENABLE = 7,
 }
 public enum mjtJoint : int{
   mjJNT_FREE = 0,
@@ -391,6 +393,13 @@ public enum mjtDataType : int{
   mjDATATYPE_AXIS = 2,
   mjDATATYPE_QUATERNION = 3,
 }
+public enum mjtSameFrame : int{
+  mjSAMEFRAME_NONE = 0,
+  mjSAMEFRAME_BODY = 1,
+  mjSAMEFRAME_INERTIA = 2,
+  mjSAMEFRAME_BODYROT = 3,
+  mjSAMEFRAME_INERTIAROT = 4,
+}
 public enum mjtLRMode : int{
   mjLRMODE_NONE = 0,
   mjLRMODE_MUSCLE = 1,
@@ -461,6 +470,11 @@ public enum mjtLimited : int{
   mjLIMITED_FALSE = 0,
   mjLIMITED_TRUE = 1,
   mjLIMITED_AUTO = 2,
+}
+public enum mjtAlignFree : int{
+  mjALIGNFREE_FALSE = 0,
+  mjALIGNFREE_TRUE = 1,
+  mjALIGNFREE_AUTO = 2,
 }
 public enum mjtInertiaFromGeom : int{
   mjINERTIAFROMGEOM_FALSE = 0,
@@ -4913,12 +4927,18 @@ public unsafe struct mjData_ {
   public double* subtree_angmom;
   public double* qH;
   public double* qHDiagInv;
-  public int* D_rownnz;
-  public int* D_rowadr;
-  public int* D_colind;
   public int* B_rownnz;
   public int* B_rowadr;
   public int* B_colind;
+  public int* C_rownnz;
+  public int* C_rowadr;
+  public int* C_colind;
+  public int* mapM2C;
+  public int* D_rownnz;
+  public int* D_rowadr;
+  public int* D_colind;
+  public int* mapM2D;
+  public int* mapD2M;
   public double* qDeriv;
   public double* qLU;
   public double* actuator_force;
@@ -5000,7 +5020,7 @@ public unsafe struct mjOption_ {
   public double tolerance;
   public double ls_tolerance;
   public double noslip_tolerance;
-  public double mpr_tolerance;
+  public double ccd_tolerance;
   public fixed double gravity[3];
   public fixed double wind[3];
   public fixed double magnetic[3];
@@ -5017,7 +5037,7 @@ public unsafe struct mjOption_ {
   public int iterations;
   public int ls_iterations;
   public int noslip_iterations;
-  public int mpr_iterations;
+  public int ccd_iterations;
   public int disableflags;
   public int enableflags;
   public int disableactuator;
@@ -5164,6 +5184,7 @@ public unsafe struct mjModel_ {
   public int nflexedge;
   public int nflexelem;
   public int nflexelemdata;
+  public int nflexelemedge;
   public int nflexshelldata;
   public int nflexevpair;
   public int nflextexcoord;
@@ -5212,8 +5233,9 @@ public unsafe struct mjModel_ {
   public int nnames_map;
   public int npaths;
   public int nM;
-  public int nD;
   public int nB;
+  public int nC;
+  public int nD;
   public int ntree;
   public int ngravcomp;
   public int nemax;
@@ -5384,6 +5406,7 @@ public unsafe struct mjModel_ {
   public int* flex_elemadr;
   public int* flex_elemnum;
   public int* flex_elemdataadr;
+  public int* flex_elemedgeadr;
   public int* flex_shellnum;
   public int* flex_shelldataadr;
   public int* flex_evpairadr;
@@ -5392,6 +5415,7 @@ public unsafe struct mjModel_ {
   public int* flex_vertbodyid;
   public int* flex_edge;
   public int* flex_elem;
+  public int* flex_elemedge;
   public int* flex_elemlayer;
   public int* flex_shell;
   public int* flex_evpair;
@@ -5400,6 +5424,8 @@ public unsafe struct mjModel_ {
   public double* flexedge_length0;
   public double* flexedge_invweight0;
   public double* flex_radius;
+  public double* flex_stiffness;
+  public double* flex_damping;
   public double* flex_edgestiffness;
   public double* flex_edgedamping;
   public byte* flex_edgeequality;
@@ -5492,6 +5518,7 @@ public unsafe struct mjModel_ {
   public int* eq_type;
   public int* eq_obj1id;
   public int* eq_obj2id;
+  public int* eq_objtype;
   public byte* eq_active0;
   public double* eq_solref;
   public double* eq_solimp;
@@ -5758,6 +5785,8 @@ public unsafe struct mjuiThemeColor_ {
   public fixed float thumb[3];
   public fixed float secttitle[3];
   public fixed float secttitle2[3];
+  public fixed float secttitleuncheck[3];
+  public fixed float secttitleuncheck2[3];
   public fixed float secttitlecheck[3];
   public fixed float secttitlecheck2[3];
   public fixed float sectfont[3];
@@ -6292,6 +6321,7 @@ public unsafe struct model {
   public int* eq_type;
   public int* eq_obj1id;
   public int* eq_obj2id;
+  public int* eq_objtype;
   public double* eq_data;
   public int* tendon_num;
   public int* tendon_matid;
@@ -6704,6 +6734,9 @@ public static unsafe extern void mj_jacSite(mjModel_* m, mjData_* d, double* jac
 
 [DllImport("mujoco", CallingConvention = CallingConvention.Cdecl)]
 public static unsafe extern void mj_jacPointAxis(mjModel_* m, mjData_* d, double* jacPoint, double* jacAxis, double* point, double* axis, int body);
+
+[DllImport("mujoco", CallingConvention = CallingConvention.Cdecl)]
+public static unsafe extern void mj_jacDot(mjModel_* m, mjData_* d, double* jacp, double* jacr, double* point, int body);
 
 [DllImport("mujoco", CallingConvention = CallingConvention.Cdecl)]
 public static unsafe extern void mj_angmomMat(mjModel_* m, mjData_* d, double* mat, int body);

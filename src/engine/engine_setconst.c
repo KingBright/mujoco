@@ -20,6 +20,7 @@
 #include <mujoco/mjdata.h>
 #include <mujoco/mjmacro.h>
 #include <mujoco/mjmodel.h>
+#include <mujoco/mjsan.h>  // IWYU pragma: keep
 #include "engine/engine_core_constraint.h"
 #include "engine/engine_core_smooth.h"
 #include "engine/engine_forward.h"
@@ -286,36 +287,53 @@ static void set0(mjModel* m, mjData* d) {
 
     // connect constraint
     if (m->eq_type[i] == mjEQ_CONNECT) {
-      // pos = anchor position in global frame
-      mj_local2Global(d, pos, 0, m->eq_data+mjNEQDATA*i, 0, id1, 0);
+      switch ((mjtObj) m->eq_objtype[i]) {
+        case mjOBJ_BODY:
+          // pos = anchor position in global frame
+          mj_local2Global(d, pos, 0, m->eq_data+mjNEQDATA*i, 0, id1, 0);
 
-      // data[3-5] = anchor position in body2 local frame
-      mju_subFrom3(pos, d->xpos+3*id2);
-      mju_mulMatTVec3(m->eq_data+mjNEQDATA*i+3, d->xmat+9*id2, pos);
+          // data[3-5] = anchor position in body2 local frame
+          mju_subFrom3(pos, d->xpos+3*id2);
+          mju_mulMatTVec3(m->eq_data+mjNEQDATA*i+3, d->xmat+9*id2, pos);
+          break;
+        case mjOBJ_SITE:
+          // site-based connect, eq_data is unused
+          mju_zero(m->eq_data+mjNEQDATA*i, mjNEQDATA);
+          break;
+        default:
+          mjERROR("invalid objtype in connect constraint %d", i);
+      }
     }
 
     // weld constraint
     else if (m->eq_type[i] == mjEQ_WELD) {
-      // skip if user has set any quaternion data
-      if (m->eq_data[mjNEQDATA*i+6] ||
-          m->eq_data[mjNEQDATA*i+7] ||
-          m->eq_data[mjNEQDATA*i+8] ||
-          m->eq_data[mjNEQDATA*i+9]) {
-        // normalize quaternion just in case
-        mju_normalize4(m->eq_data+mjNEQDATA*i+6);
-        continue;
+      switch ((mjtObj) m->eq_objtype[i]) {
+        case mjOBJ_BODY: {
+          // skip if user has set any quaternion data
+          if (!mju_isZero(m->eq_data + mjNEQDATA*i + 6, 4)) {
+            // normalize quaternion just in case
+            mju_normalize4(m->eq_data+mjNEQDATA*i+6);
+            continue;
+          }
+
+          // anchor position is in body2 local frame
+          mj_local2Global(d, pos, 0, m->eq_data+mjNEQDATA*i, 0, id2, 0);
+
+          // data[3-5] = anchor position in body1 local frame
+          mju_subFrom3(pos, d->xpos+3*id1);
+          mju_mulMatTVec3(m->eq_data+mjNEQDATA*i+3, d->xmat+9*id1, pos);
+
+          // data[6-9] = neg(xquat1)*xquat2 = "xquat2-xquat1" in body1 local frame
+          mju_negQuat(quat, d->xquat+4*id1);
+          mju_mulQuat(m->eq_data+mjNEQDATA*i+6, quat, d->xquat+4*id2);
+          break;
+        }
+        case mjOBJ_SITE: {
+          break;
+        }
+        default:
+          mjERROR("invalid objtype in weld constraint %d", i);
       }
-
-      // anchor position is in body2 local frame
-      mj_local2Global(d, pos, 0, m->eq_data+mjNEQDATA*i, 0, id2, 0);
-
-      // data[3-5] = anchor position in body1 local frame
-      mju_subFrom3(pos, d->xpos+3*id1);
-      mju_mulMatTVec3(m->eq_data+mjNEQDATA*i+3, d->xmat+9*id1, pos);
-
-      // data[6-9] = neg(xquat1)*xquat2 = "xquat2-xquat1" in body1 local frame
-      mju_negQuat(quat, d->xquat+4*id1);
-      mju_mulQuat(m->eq_data+mjNEQDATA*i+6, quat, d->xquat+4*id2);
     }
   }
 

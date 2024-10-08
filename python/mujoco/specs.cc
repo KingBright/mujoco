@@ -19,6 +19,8 @@
 #include <optional>
 #include <string>
 #include <string_view>  // IWYU pragma: keep
+#include <unordered_map>
+#include <utility>
 #include <vector>       // IWYU pragma: keep
 
 #include <Eigen/Core>
@@ -69,8 +71,88 @@ using MjDoubleRefVec = Eigen::Ref<const Eigen::VectorXd>;
 
 struct MjSpec {
   MjSpec() : ptr(mj_makeSpec()) {}
+  MjSpec(raw::MjSpec* ptr) : ptr(ptr) {}
+
+  // copy constructor and assignment
+  MjSpec(const MjSpec& other) : ptr(mj_copySpec(other.ptr)) {}
+  MjSpec& operator=(const MjSpec& other) {
+    ptr = mj_copySpec(other.ptr);
+    return *this;
+  }
+
+  // move constructor and move assignment
+  MjSpec(MjSpec&& other) : ptr(other.ptr) { other.ptr = nullptr; }
+  MjSpec& operator=(MjSpec&& other) {
+    ptr = other.ptr;
+    other.ptr = nullptr;
+    return *this;
+  }
+
   ~MjSpec() { mj_deleteSpec(ptr); }
   raw::MjSpec* ptr;
+};
+
+template <typename LoadFunc>
+static raw::MjSpec* LoadSpecFileImpl(
+    const std::string& filename,
+    const std::vector<_impl::VfsAsset>& assets,
+    LoadFunc&& loadfunc) {
+  mjVFS vfs;
+  mjVFS* vfs_ptr = nullptr;
+  if (!assets.empty()) {
+    mj_defaultVFS(&vfs);
+    vfs_ptr = &vfs;
+    for (const auto& asset : assets) {
+      std::string buffer_name = _impl::StripPath(asset.name);
+      const int vfs_error = InterceptMjErrors(mj_addBufferVFS)(
+          vfs_ptr, buffer_name.c_str(), asset.content, asset.content_size);
+      if (vfs_error) {
+        mj_deleteVFS(vfs_ptr);
+        if (vfs_error == 2) {
+          throw py::value_error("Repeated file name in assets dict: " +
+                                buffer_name);
+        } else {
+          throw py::value_error("Asset failed to load: " + buffer_name);
+        }
+      }
+    }
+  }
+
+  raw::MjSpec* spec = loadfunc(filename.c_str(), vfs_ptr);
+  mj_deleteVFS(vfs_ptr);
+  return spec;
+}
+
+template <typename T>
+struct MjTypeVec {
+  MjTypeVec(T* data, int size) : ptr(data), size(size) {}
+  T* ptr;
+  int size;
+};
+
+template <typename T>
+void DefineArray(py::module& m, const std::string& typestr) {
+  using Class = MjTypeVec<T>;
+  py::class_<Class>(m, typestr.c_str())
+      .def(py::init([](T* data, int size) { return Class(data, size); }))
+      .def("__getitem__",
+           [](Class& v, int i) {
+             if (i < 0 || i >= v.size) {
+               throw py::index_error("Index out of range.");
+             }
+             return v.ptr[i];
+           })
+      .def("__setitem__",
+           [](Class& v, int i, T c) {
+             if (i < 0 || i >= v.size) {
+               throw py::index_error("Index out of range.");
+             }
+             v.ptr[i] = std::move(c);
+           })
+      .def("__len__", [](Class& v) { return v.size; })
+      .def("__iter__", [](Class& v) {
+        return py::make_iterator(v.ptr, v.ptr + v.size);
+      }, py::keep_alive<0, 1>(), py::return_value_policy::reference_internal);
 };
 
 PYBIND11_MODULE(_specs, m) {
@@ -109,9 +191,90 @@ PYBIND11_MODULE(_specs, m) {
   py::class_<raw::MjsPlugin> mjsPlugin(m, "MjsPlugin");
   py::class_<raw::MjsOrientation> mjsOrientation(m, "MjsOrientation");
   py::class_<raw::MjsWrap> mjsWrap(m, "MjsWrap");
+  py::class_<raw::MjOption> mjOption(m, "MjOption");
+  py::class_<raw::MjStatistic> mjStatistic(m, "MjStatistic");
+  py::class_<raw::MjVisual> mjVisual(m, "MjVisual");
+  DefineArray<char>(m, "MjCharVec");
+  DefineArray<std::string>(m, "MjStringVec");
+  DefineArray<std::byte>(m, "MjByteVec");
 
   // ============================= MJSPEC =====================================
   mjSpec.def(py::init<>());
+  mjSpec.def_static(
+      "from_file",
+      [](std::string& filename,
+         std::optional<std::unordered_map<std::string, py::bytes>>& assets)
+          -> MjSpec {
+        const auto converted_assets = _impl::ConvertAssetsDict(assets);
+        raw::MjSpec* spec;
+        {
+          py::gil_scoped_release no_gil;
+          char error[1024];
+          spec = LoadSpecFileImpl(
+              filename, converted_assets,
+              [&error](const char* filename, const mjVFS* vfs) {
+                return InterceptMjErrors(mj_parseXML)(
+                    filename, vfs, error, sizeof(error));
+              });
+          if (!spec) {
+            throw py::value_error(error);
+          }
+        }
+        return MjSpec(spec);
+      },
+      py::arg("filename"), py::arg("assets") = py::none(), R"mydelimiter(
+    Creates a spec from an XML file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the XML file.
+    assets : dict, optional
+        A dictionary of assets to be used by the spec. The keys are asset names
+        and the values are asset contents.
+  )mydelimiter", py::return_value_policy::move);
+  mjSpec.def_static(
+      "from_string",
+      [](std::string& xml,
+         std::optional<std::unordered_map<std::string, py::bytes>>& assets)
+          -> MjSpec {
+        auto converted_assets = _impl::ConvertAssetsDict(assets);
+        raw::MjSpec* spec;
+        {
+          py::gil_scoped_release no_gil;
+          std::string model_filename = "model_.xml";
+          if (assets.has_value()) {
+            while (assets->find(model_filename) != assets->end()) {
+              model_filename =
+                  model_filename.substr(0, model_filename.size() - 4) + "_.xml";
+            }
+          }
+          converted_assets.emplace_back(
+              model_filename.c_str(), xml.c_str(), xml.length());
+          char error[1024];
+          spec = LoadSpecFileImpl(
+              model_filename, converted_assets,
+              [&error](const char* filename, const mjVFS* vfs) {
+                return InterceptMjErrors(mj_parseXML)(
+                    filename, vfs, error, sizeof(error));
+              });
+          if (!spec) {
+            throw py::value_error(error);
+          }
+        }
+        return MjSpec(spec);
+      },
+      py::arg("xml"), py::arg("assets") = py::none(), R"mydelimiter(
+    Creates a spec from an XML string.
+
+    Parameters
+    ----------
+    xml : str
+        XML string.
+    assets : dict, optional
+        A dictionary of assets to be used by the spec. The keys are asset names
+        and the values are asset contents.
+  )mydelimiter", py::return_value_policy::move);
   mjSpec.def("recompile", [mjmodel_mjdata_from_spec_ptr](
                               const MjSpec& self, py::object m, py::object d) {
     return mjmodel_mjdata_from_spec_ptr(reinterpret_cast<uintptr_t>(self.ptr),
@@ -134,21 +297,9 @@ PYBIND11_MODULE(_specs, m) {
       },
       py::return_value_policy::reference_internal);
   mjSpec.def(
-      "find_mesh",
-      [](MjSpec& self, std::string& name) -> raw::MjsMesh* {
-        return mjs_findMesh(self.ptr, name.c_str());
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
       "find_frame",
       [](MjSpec& self, std::string& name) -> raw::MjsFrame* {
         return mjs_findFrame(self.ptr, name.c_str());
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "find_keyframe",
-      [](MjSpec& self, std::string& name) -> raw::MjsKey* {
-        return mjs_findKeyframe(self.ptr, name.c_str());
       },
       py::return_value_policy::reference_internal);
   mjSpec.def(
@@ -203,74 +354,6 @@ PYBIND11_MODULE(_specs, m) {
     return std::string(buf.get());
   });
   mjSpec.def(
-      "from_file",
-      [](MjSpec& self, std::string& filename,
-         std::optional<py::dict>& assets) -> void {
-        mjVFS vfs;
-        mj_defaultVFS(&vfs);
-        if (assets.has_value()) {
-          for (auto item : assets.value()) {
-            std::string buffer = py::cast<std::string>(item.second);
-            mj_addBufferVFS(&vfs, py::cast<std::string>(item.first).c_str(),
-                            buffer.c_str(), buffer.size());
-          };
-        }
-        std::array<char, 1024> err;
-        err[0] = '\0';
-        mj_deleteSpec(self.ptr);
-        self.ptr = mj_parseXML(filename.c_str(), &vfs, err.data(), err.size());
-        mj_deleteVFS(&vfs);
-        if (!self.ptr) {
-          throw FatalError(std::string(err.data()));
-        }
-      },
-      py::arg("filename"),
-      py::arg("assets") = py::none(), R"mydelimiter(
-    Creates a spec from an XML file.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the XML file.
-    assets : dict, optional
-        A dictionary of assets to be used by the spec. The keys are asset names
-        and the values are asset contents.
-  )mydelimiter");
-  mjSpec.def(
-      "from_string",
-      [](MjSpec& self, std::string& xml,
-         std::optional<py::dict>& assets) -> void {
-        mjVFS vfs;
-        mj_defaultVFS(&vfs);
-        if (assets.has_value()) {
-          for (auto item : assets.value()) {
-            std::string buffer = py::cast<std::string>(item.second);
-            mj_addBufferVFS(&vfs, py::cast<std::string>(item.first).c_str(),
-                            buffer.c_str(), buffer.size());
-          };
-        }
-        std::array<char, 1024> err;
-        err[0] = '\0';
-        mj_deleteSpec(self.ptr);
-        self.ptr = mj_parseXMLString(xml.c_str(), &vfs, err.data(), err.size());
-        mj_deleteVFS(&vfs);
-        if (!self.ptr) {
-          throw FatalError(std::string(err.data()));
-        }
-      },
-      py::arg("xml"),
-      py::arg("assets") = py::none(), R"mydelimiter(
-    Creates a spec from an XML string.
-
-    Parameters
-    ----------
-    xml : str
-        XML string.
-    assets : dict, optional
-        A dictionary of assets to be used by the spec. The keys are asset names
-        and the values are asset contents.
-  )mydelimiter");
-  mjSpec.def(
       "add_default",
       [](MjSpec* spec, std::string& classname,
          raw::MjsDefault* parent) -> raw::MjsDefault* {
@@ -283,345 +366,46 @@ PYBIND11_MODULE(_specs, m) {
         return mjs_getSpecDefault(self.ptr);
       },
       py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_material",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsMaterial* {
-        return mjs_addMaterial(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_mesh",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsMesh* {
-        return mjs_addMesh(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_skin",
-      [](MjSpec& self) -> raw::MjsSkin* { return mjs_addSkin(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_texture",
-      [](MjSpec& self) -> raw::MjsTexture* { return mjs_addTexture(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_text",
-      [](MjSpec& self) -> raw::MjsText* { return mjs_addText(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_tuple",
-      [](MjSpec& self) -> raw::MjsTuple* { return mjs_addTuple(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_flex",
-      [](MjSpec& self) -> raw::MjsFlex* { return mjs_addFlex(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_hfield",
-      [](MjSpec& self) -> raw::MjsHField* { return mjs_addHField(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_key",
-      [](MjSpec& self) -> raw::MjsKey* { return mjs_addKey(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_numeric",
-      [](MjSpec& self) -> raw::MjsNumeric* { return mjs_addNumeric(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_pair",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsPair* {
-        return mjs_addPair(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_exclude",
-      [](MjSpec& self) -> raw::MjsExclude* { return mjs_addExclude(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_equality",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsEquality* {
-        return mjs_addEquality(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_tendon",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsTendon* {
-        return mjs_addTendon(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_sensor",
-      [](MjSpec& self) -> raw::MjsSensor* { return mjs_addSensor(self.ptr); },
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_actuator",
-      [](MjSpec& self, raw::MjsDefault* default_) -> raw::MjsActuator* {
-        return mjs_addActuator(self.ptr, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjSpec.def(
-      "add_plugin",
-      [](MjSpec& self) -> raw::MjsPlugin* { return mjs_addPlugin(self.ptr); },
-      py::return_value_policy::reference_internal);
   mjSpec.def("detach_body", [](MjSpec& self, raw::MjsBody& body) {
     mjs_detachBody(self.ptr, &body);
   });
-  mjSpec.def_property_readonly(
-      "actuators",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_ACTUATOR);
-        while (el) {
-          list.append(mjs_asActuator(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "sensors",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_SENSOR);
-        while (el) {
-          list.append(mjs_asSensor(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "flexes",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_FLEX);
-        while (el) {
-          list.append(mjs_asFlex(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "pairs",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_PAIR);
-        while (el) {
-          list.append(mjs_asPair(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "equality",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_EQUALITY);
-        while (el) {
-          list.append(mjs_asEquality(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "excludes",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_EXCLUDE);
-        while (el) {
-          list.append(mjs_asExclude(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "tendons",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_TENDON);
-        while (el) {
-          list.append(mjs_asTendon(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "numeric",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_NUMERIC);
-        while (el) {
-          list.append(mjs_asNumeric(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "text",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_TEXT);
-        while (el) {
-          list.append(mjs_asText(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "tuple",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_TUPLE);
-        while (el) {
-          list.append(mjs_asTuple(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "key",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_KEY);
-        while (el) {
-          list.append(mjs_asKey(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "mesh",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_MESH);
-        while (el) {
-          list.append(mjs_asMesh(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "hfield",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_HFIELD);
-        while (el) {
-          list.append(mjs_asHField(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "skin",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_SKIN);
-        while (el) {
-          list.append(mjs_asSkin(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "texture",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_TEXTURE);
-        while (el) {
-          list.append(mjs_asTexture(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
-  mjSpec.def_property_readonly(
-      "material",
-      [](MjSpec& self) -> py::list {
-        py::list list;
-        raw::MjsElement* el = mjs_firstElement(self.ptr, mjOBJ_MATERIAL);
-        while (el) {
-          list.append(mjs_asMaterial(el));
-          el = mjs_nextElement(self.ptr, el);
-        }
-        return list;
-      },
-      py::return_value_policy::reference_internal);
 
   // ============================= MJSBODY =====================================
   mjsBody.def_property_readonly(
       "id", [](raw::MjsBody& self) -> int { return mjs_getId(self.element); });
   mjsBody.def(
-      "add_body",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsBody* {
-        return mjs_addBody(&self, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_frame",
-      [](raw::MjsBody& self, raw::MjsFrame* parentframe_) -> raw::MjsFrame* {
-        return mjs_addFrame(&self, parentframe_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_geom",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsGeom* {
-        return mjs_addGeom(&self, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_joint",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsJoint* {
-        return mjs_addJoint(&self, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
       "add_freejoint",
-      [](raw::MjsBody& self) -> raw::MjsJoint* {
-        return mjs_addFreeJoint(&self);
+      [](raw::MjsBody& self, py::kwargs kwargs) -> raw::MjsJoint* {
+        auto out = mjs_addFreeJoint(&self);
+        py::dict kwarg_dict = kwargs;
+        for (auto item : kwarg_dict) {
+          std::string key = py::str(item.first);
+          if (key == "align") {
+            try {
+              out->align = kwargs["align"].cast<int>();
+            } catch (const py::cast_error& e) {
+              throw pybind11::value_error("align is the wrong type.");
+            }
+          } else if (key == "name") {
+            try {
+              *out->name = kwargs["name"].cast<std::string>();
+            } catch (const py::cast_error& e) {
+              throw pybind11::value_error("name is the wrong type.");
+            }
+          } else if (key == "group") {
+            try {
+              out->group = kwargs["group"].cast<int>();
+            } catch (const py::cast_error& e) {
+              throw pybind11::value_error("group is the wrong type.");
+            }
+          } else {
+            throw pybind11::type_error(
+                "Invalid " + key +
+                " keyword argument. Valid options are: align, group, name.");
+          }
+        }
+        return out;
       },
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_light",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsLight* {
-        return mjs_addLight(&self, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_site",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsSite* {
-        return mjs_addSite(&self, default_);
-      },
-      py::arg_v("default", nullptr),
-      py::return_value_policy::reference_internal);
-  mjsBody.def(
-      "add_camera",
-      [](raw::MjsBody& self, raw::MjsDefault* default_) -> raw::MjsCamera* {
-        return mjs_addCamera(&self, default_);
-      },
-      py::arg_v("default", nullptr),
       py::return_value_policy::reference_internal);
   mjsBody.def("set_frame",
               [](raw::MjsBody& self, raw::MjsFrame& frame) -> void {
@@ -638,6 +422,50 @@ PYBIND11_MODULE(_specs, m) {
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
+      "find_all",
+      [](raw::MjsBody& self, mjtObj objtype) -> py::list {
+        py::list list;
+        raw::MjsElement* el = mjs_firstChild(&self, objtype, true);
+        std::string error = mjs_getError(mjs_getSpec(&self));
+        if (!el && !error.empty()) {
+          throw pybind11::value_error(error);
+        }
+        while (el) {
+          switch (objtype) {
+            case mjOBJ_BODY:
+              list.append(mjs_asBody(el));
+              break;
+            case mjOBJ_CAMERA:
+              list.append(mjs_asCamera(el));
+              break;
+            case mjOBJ_FRAME:
+              list.append(mjs_asFrame(el));
+              break;
+            case mjOBJ_GEOM:
+              list.append(mjs_asGeom(el));
+              break;
+            case mjOBJ_JOINT:
+              list.append(mjs_asJoint(el));
+              break;
+            case mjOBJ_LIGHT:
+              list.append(mjs_asLight(el));
+              break;
+            case mjOBJ_SITE:
+              list.append(mjs_asSite(el));
+              break;
+            default:
+              // this should never happen
+              throw pybind11::value_error(
+                  "body.find_all supports the types: body, frame, geom, site, "
+                  "light, camera.");
+              break;
+          }
+          el = mjs_nextChild(&self, el, true);
+        }
+        return list;
+      },
+      py::return_value_policy::reference_internal);
+  mjsBody.def(
       "find_child",
       [](raw::MjsBody& self, std::string& name) -> raw::MjsBody* {
         return mjs_findChild(&self, name.c_str());
@@ -646,96 +474,103 @@ PYBIND11_MODULE(_specs, m) {
   mjsBody.def(
       "first_body",
       [](raw::MjsBody& self) -> raw::MjsBody* {
-        return mjs_asBody(mjs_firstChild(&self, mjOBJ_BODY));
+        return mjs_asBody(mjs_firstChild(&self, mjOBJ_BODY, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_body",
       [](raw::MjsBody& self, raw::MjsBody& child) -> raw::MjsBody* {
-        return mjs_asBody(mjs_nextChild(&self, child.element));
+        return mjs_asBody(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_camera",
       [](raw::MjsBody& self) -> raw::MjsCamera* {
-        return mjs_asCamera(mjs_firstChild(&self, mjOBJ_CAMERA));
+        return mjs_asCamera(mjs_firstChild(&self, mjOBJ_CAMERA, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_camera",
       [](raw::MjsBody& self, raw::MjsCamera& child) -> raw::MjsCamera* {
-        return mjs_asCamera(mjs_nextChild(&self, child.element));
+        return mjs_asCamera(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_light",
       [](raw::MjsBody& self) -> raw::MjsLight* {
-        return mjs_asLight(mjs_firstChild(&self, mjOBJ_LIGHT));
+        return mjs_asLight(mjs_firstChild(&self, mjOBJ_LIGHT, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_light",
       [](raw::MjsBody& self, raw::MjsLight& child) -> raw::MjsLight* {
-        return mjs_asLight(mjs_nextChild(&self, child.element));
+        return mjs_asLight(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_joint",
       [](raw::MjsBody& self) -> raw::MjsJoint* {
-        return mjs_asJoint(mjs_firstChild(&self, mjOBJ_JOINT));
+        return mjs_asJoint(mjs_firstChild(&self, mjOBJ_JOINT, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_joint",
       [](raw::MjsBody& self, raw::MjsJoint& child) -> raw::MjsJoint* {
-        return mjs_asJoint(mjs_nextChild(&self, child.element));
+        return mjs_asJoint(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_geom",
       [](raw::MjsBody& self) -> raw::MjsGeom* {
-        return mjs_asGeom(mjs_firstChild(&self, mjOBJ_GEOM));
+        return mjs_asGeom(mjs_firstChild(&self, mjOBJ_GEOM, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_geom",
       [](raw::MjsBody& self, raw::MjsGeom& child) -> raw::MjsGeom* {
-        return mjs_asGeom(mjs_nextChild(&self, child.element));
+        return mjs_asGeom(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_site",
       [](raw::MjsBody& self) -> raw::MjsSite* {
-        return mjs_asSite(mjs_firstChild(&self, mjOBJ_SITE));
+        return mjs_asSite(mjs_firstChild(&self, mjOBJ_SITE, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_site",
       [](raw::MjsBody& self, raw::MjsSite& child) -> raw::MjsSite* {
-        return mjs_asSite(mjs_nextChild(&self, child.element));
+        return mjs_asSite(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "first_frame",
       [](raw::MjsBody& self) -> raw::MjsFrame* {
-        return mjs_asFrame(mjs_firstChild(&self, mjOBJ_FRAME));
+        return mjs_asFrame(mjs_firstChild(&self, mjOBJ_FRAME, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "next_frame",
       [](raw::MjsBody& self, raw::MjsFrame& child) -> raw::MjsFrame* {
-        return mjs_asFrame(mjs_nextChild(&self, child.element));
+        return mjs_asFrame(mjs_nextChild(&self, child.element, false));
       },
       py::return_value_policy::reference_internal);
   mjsBody.def(
       "spec",
       [](raw::MjsBody& self) -> raw::MjSpec* { return mjs_getSpec(&self); },
       py::return_value_policy::reference_internal);
-  mjsBody.def("attach_frame",
-              [](raw::MjsBody& self, raw::MjsFrame& frame, std::string& prefix,
-                 std::string& suffix) -> void {
-                mjs_attachFrame(&self, &frame, prefix.c_str(), suffix.c_str());
-              });
+  mjsBody.def(
+      "attach_frame",
+      [](raw::MjsBody& self, raw::MjsFrame& frame, std::string& prefix,
+         std::string& suffix) -> raw::MjsFrame* {
+        auto new_frame =
+            mjs_attachFrame(&self, &frame, prefix.c_str(), suffix.c_str());
+        if (!new_frame) {
+          throw pybind11::value_error(mjs_getError(mjs_getSpec(&self)));
+        }
+        return new_frame;
+      },
+      py::return_value_policy::reference_internal);
 
   // ============================= MJSFRAME ====================================
   mjsFrame.def_property_readonly(
@@ -744,10 +579,19 @@ PYBIND11_MODULE(_specs, m) {
   mjsFrame.def("set_frame", [](raw::MjsFrame& self, raw::MjsFrame& frame) {
     mjs_setFrame(self.element, &frame);
   });
-  mjsFrame.def("attach_body", [](raw::MjsFrame& self, raw::MjsBody& body,
-                                 std::string& prefix, std::string& suffix) {
-    mjs_attachBody(&self, &body, prefix.c_str(), suffix.c_str());
-  });
+  mjsFrame.def(
+      "attach_body",
+      [](raw::MjsFrame& self, raw::MjsBody& body, std::string& prefix,
+         std::string& suffix) -> raw::MjsBody* {
+        auto new_body =
+            mjs_attachBody(&self, &body, prefix.c_str(), suffix.c_str());
+        if (!new_body) {
+          throw pybind11::value_error(
+              mjs_getError(mjs_getSpecFromFrame(&self)));
+        }
+        return new_body;
+      },
+      py::return_value_policy::reference_internal);
 
   // ============================= MJSGEOM =====================================
   mjsGeom.def_property_readonly(
@@ -1017,11 +861,14 @@ PYBIND11_MODULE(_specs, m) {
   mjsTuple.def("delete", [](raw::MjsTuple& self) { mjs_delete(self.element); });
 
   // ============================= MJSPLUGIN ===================================
-  mjsPlugin.def_property_readonly("id", [](raw::MjsPlugin& self) -> int {
-    return mjs_getId(self.instance);
-  });
+  mjsPlugin.def_property(
+      "id",
+      [](raw::MjsPlugin& self) -> int { return mjs_getId(self.element); },
+      [](raw::MjsPlugin& self, raw::MjsPlugin* other) {
+        self.element = other->element;
+      });
   mjsPlugin.def("delete",
-                [](raw::MjsPlugin& self) { mjs_delete(self.instance); });
+                [](raw::MjsPlugin& self) { mjs_delete(self.element); });
 
 #include "specs.cc.inc"
 }  // PYBIND11_MODULE // NOLINT
